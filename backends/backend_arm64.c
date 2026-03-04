@@ -29,6 +29,7 @@ static const char *const ARM64_SCRATCH_GP_REGS32[] = {"w9", "w10", "w11", "w12"}
 
 #define ARM64_FRAME_REG "x27"
 #define ARM64_FRAME_REG32 "w27"
+#define ARM64_RAW_EXPORT_PREFIX "__cc_raw_export__"
 
 typedef enum
 {
@@ -1206,6 +1207,23 @@ static bool arm64_is_local_symbol(const Arm64ModuleContext *ctx, const char *nam
 	return (name[0] == '.' && name[1] == 'L');
 }
 
+
+static bool arm64_is_raw_export_symbol(const char *name)
+{
+    if (!name)
+        return false;
+    return strncmp(name, ARM64_RAW_EXPORT_PREFIX, strlen(ARM64_RAW_EXPORT_PREFIX)) == 0;
+}
+
+static const char *arm64_visible_symbol_name(const char *name)
+{
+    if (!name)
+        return NULL;
+    if (arm64_is_raw_export_symbol(name))
+        return name + strlen(ARM64_RAW_EXPORT_PREFIX);
+    return name;
+}
+
 static const char *arm64_format_symbol(const Arm64ModuleContext *ctx, const char *name, char *buffer, size_t buffer_size)
 {
 	if (!buffer || buffer_size == 0)
@@ -1215,10 +1233,11 @@ static const char *arm64_format_symbol(const Arm64ModuleContext *ctx, const char
 		buffer[0] = '\0';
 		return buffer;
 	}
-	if (ctx && ctx->config && ctx->config->prefix_symbols_with_underscore && name[0] != '_' && !arm64_is_local_symbol(ctx, name))
-		snprintf(buffer, buffer_size, "_%s", name);
+	const char *visible = arm64_visible_symbol_name(name);
+	if (ctx && ctx->config && ctx->config->prefix_symbols_with_underscore && visible[0] != '_' && !arm64_is_local_symbol(ctx, visible) && !arm64_is_raw_export_symbol(name))
+		snprintf(buffer, buffer_size, "_%s", visible);
 	else
-		snprintf(buffer, buffer_size, "%s", name);
+		snprintf(buffer, buffer_size, "%s", visible);
 	return buffer;
 }
 

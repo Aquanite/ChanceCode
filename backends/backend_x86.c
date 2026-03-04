@@ -12,6 +12,7 @@
 #include <string.h>
 
 #define X86_STACK_ALIGNMENT 16
+#define X86_RAW_EXPORT_PREFIX "__cc_raw_export__"
 
 typedef enum
 {
@@ -511,6 +512,22 @@ static char *x86_strdup(const char *src)
     return copy;
 }
 
+static bool x86_is_raw_export_symbol(const char *name)
+{
+    if (!name)
+        return false;
+    return strncmp(name, X86_RAW_EXPORT_PREFIX, strlen(X86_RAW_EXPORT_PREFIX)) == 0;
+}
+
+static const char *x86_visible_symbol_name(const char *name)
+{
+    if (!name)
+        return NULL;
+    if (x86_is_raw_export_symbol(name))
+        return name + strlen(X86_RAW_EXPORT_PREFIX);
+    return name;
+}
+
 static void hidden_function_aliases_destroy(X86ModuleContext *ctx)
 {
     if (!ctx || !ctx->hidden_fn_aliases)
@@ -551,7 +568,7 @@ static const char *module_function_symbol(X86ModuleContext *ctx, const CCFunctio
     if (!ctx || !fn)
         return fn ? fn->name : NULL;
     if (ctx->keep_debug_names || !fn->is_hidden)
-        return fn->name;
+        return x86_visible_symbol_name(fn->name);
 
     for (size_t i = 0; i < ctx->hidden_fn_alias_count; ++i)
     {
@@ -580,9 +597,9 @@ static const char *module_symbol_alias(X86ModuleContext *ctx, const char *symbol
         return symbol;
     const CCFunction *fn = module_find_function(ctx->module, symbol);
     if (!fn)
-        return symbol;
+        return x86_visible_symbol_name(symbol);
     const char *mapped = module_function_symbol(ctx, fn);
-    return mapped ? mapped : symbol;
+    return mapped ? mapped : x86_visible_symbol_name(symbol);
 }
 
 static void label_aliases_destroy(X86FunctionContext *ctx)
@@ -2823,7 +2840,8 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
 
 static void emit_function_prologue(X86FunctionContext *ctx)
 {
-    const char *symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
+    const char *symbol =
+        ctx->symbol_name ? ctx->symbol_name : x86_visible_symbol_name(ctx->fn->name);
     bool emit_global = ctx->fn && !ctx->fn->is_hidden;
     if (emit_global)
         fprintf(ctx->out, "%s %s\n", ctx->syntax->global_directive, symbol);
@@ -3015,7 +3033,7 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
     ctx.abi = module_ctx->abi;
     ctx.symbol_name = module_function_symbol(module_ctx, fn);
     if (!ctx.symbol_name)
-        ctx.symbol_name = fn->name;
+        ctx.symbol_name = x86_visible_symbol_name(fn->name);
     ctx.function_id = module_ctx->next_function_id++;
     ctx.obfuscate_labels = !module_ctx->keep_debug_names;
 
@@ -3108,11 +3126,15 @@ static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global
     if (!global || global->is_extern)
         return;
     FILE *out = ctx->out;
+    const char *symbol_name = x86_visible_symbol_name(global->name);
+    if (!symbol_name)
+        symbol_name = global->name;
     emit_global_data_section((X86ModuleContext *)ctx, global);
-    if (!global->is_hidden && global->name && global->name[0])
-        fprintf(out, "%s %s\n", ctx->syntax->global_directive, global->name);
-    fprintf(out, "%s %zu\n", ctx->syntax->align_directive, global->alignment ? global->alignment : cc_value_type_size(global->type));
-    fprintf(out, "%s:\n", global->name);
+    if (!global->is_hidden && symbol_name && symbol_name[0])
+        fprintf(out, "%s %s\n", ctx->syntax->global_directive, symbol_name);
+    fprintf(out, "%s %zu\n", ctx->syntax->align_directive,
+            global->alignment ? global->alignment : cc_value_type_size(global->type));
+    fprintf(out, "%s:\n", symbol_name);
     size_t size = global->size ? global->size : cc_value_type_size(global->type);
     if (size == 0)
         size = 8;
@@ -3121,13 +3143,17 @@ static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global
     {
     case CC_GLOBAL_INIT_INT:
         if (size <= 1)
-            fprintf(out, "    %s 0x%02llx\n", ctx->syntax->byte_directive, (unsigned long long)global->init.payload.u64 & 0xFFULL);
+            fprintf(out, "    %s 0x%02llx\n", ctx->syntax->byte_directive,
+                    (unsigned long long)global->init.payload.u64 & 0xFFULL);
         else if (size <= 2)
-            fprintf(out, "    %s 0x%04llx\n", ctx->syntax->word_directive, (unsigned long long)global->init.payload.u64 & 0xFFFFULL);
+            fprintf(out, "    %s 0x%04llx\n", ctx->syntax->word_directive,
+                    (unsigned long long)global->init.payload.u64 & 0xFFFFULL);
         else if (size <= 4)
-            fprintf(out, "    %s 0x%08llx\n", ctx->syntax->dword_directive, (unsigned long long)global->init.payload.u64 & 0xFFFFFFFFULL);
+            fprintf(out, "    %s 0x%08llx\n", ctx->syntax->dword_directive,
+                    (unsigned long long)global->init.payload.u64 & 0xFFFFFFFFULL);
         else
-            fprintf(out, "    %s 0x%016llx\n", ctx->syntax->qword_directive, (unsigned long long)global->init.payload.u64);
+            fprintf(out, "    %s 0x%016llx\n", ctx->syntax->qword_directive,
+                    (unsigned long long)global->init.payload.u64);
         break;
     case CC_GLOBAL_INIT_FLOAT:
     {
@@ -3152,14 +3178,16 @@ static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global
                 uint64_t bits;
             } conv;
             conv.f = global->init.payload.f64;
-            fprintf(out, "    %s 0x%016llx\n", ctx->syntax->qword_directive, (unsigned long long)conv.bits);
+            fprintf(out, "    %s 0x%016llx\n", ctx->syntax->qword_directive,
+                    (unsigned long long)conv.bits);
         }
         break;
     }
     case CC_GLOBAL_INIT_STRING:
         fprintf(out, "    %s ", ctx->syntax->byte_directive);
         for (size_t i = 0; i < global->init.payload.string.length; ++i)
-            fprintf(out, "%s0x%02x", (i == 0 ? "" : ", "), (unsigned char)global->init.payload.string.data[i]);
+            fprintf(out, "%s0x%02x", (i == 0 ? "" : ", "),
+                    (unsigned char)global->init.payload.string.data[i]);
         fprintf(out, ", 0\n");
         break;
     case CC_GLOBAL_INIT_BYTES:
@@ -3172,9 +3200,15 @@ static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global
         {
             const char *entry = global->init.payload.ptrs.symbols[i];
             if (!entry || entry[0] == '\0' || strcmp(entry, "null") == 0)
+            {
                 fprintf(out, "    %s 0\n", ctx->syntax->qword_directive);
+            }
             else
-                fprintf(out, "    %s %s\n", ctx->syntax->qword_directive, entry);
+            {
+                const char *visible_entry = x86_visible_symbol_name(entry);
+                fprintf(out, "    %s %s\n", ctx->syntax->qword_directive,
+                        visible_entry ? visible_entry : entry);
+            }
         }
         break;
     }
@@ -3212,7 +3246,8 @@ static bool collect_externs(X86ModuleContext *ctx)
     for (size_t i = 0; i < module->extern_count; ++i)
     {
         const CCExtern *ext = &module->externs[i];
-        if (ext->name && !string_set_add(&ctx->externs, ext->name))
+        const char *symbol = x86_visible_symbol_name(ext->name);
+        if (symbol && !string_set_add(&ctx->externs, symbol))
             return false;
     }
 
@@ -3221,7 +3256,8 @@ static bool collect_externs(X86ModuleContext *ctx)
         const CCGlobal *global = &module->globals[i];
         if (!global || !global->is_extern || !global->name)
             continue;
-        if (!string_set_add(&ctx->externs, global->name))
+        const char *symbol = x86_visible_symbol_name(global->name);
+        if (!string_set_add(&ctx->externs, symbol))
             return false;
     }
 
@@ -3236,7 +3272,8 @@ static bool collect_externs(X86ModuleContext *ctx)
                 const char *symbol = ins->data.call.symbol;
                 if (symbol && !module_has_function(module, symbol))
                 {
-                    if (!string_set_add(&ctx->externs, symbol))
+                    const char *visible = x86_visible_symbol_name(symbol);
+                    if (!string_set_add(&ctx->externs, visible))
                         return false;
                 }
             }
