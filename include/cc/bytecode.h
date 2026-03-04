@@ -98,6 +98,7 @@ extern "C"
         CC_INSTR_RET,
         CC_INSTR_COMMENT,
         CC_INSTR_CALL_INDIRECT,
+        CC_INSTR_JUMP_INDIRECT,
         CC_INSTR_TEST_NULL,
         CC_INSTR_DUP
     } CCInstrKind;
@@ -295,6 +296,7 @@ extern "C"
         bool is_literal;
         bool is_hidden;
         bool force_inline_literal;
+        bool is_jump_target;
         bool is_preserve;
         char **literal_lines;
         size_t literal_count;

@@ -75,6 +75,7 @@ static void cc_instruction_free(CCInstruction *ins)
         ins->data.label.name = NULL;
         break;
     case CC_INSTR_JUMP:
+    case CC_INSTR_JUMP_INDIRECT:
         free(ins->data.jump.target);
         ins->data.jump.target = NULL;
         break;
@@ -402,6 +403,7 @@ CCFunction *cc_module_add_function(CCModule *module, const char *name)
     fn->is_varargs = false;
     fn->is_noreturn = false;
     fn->is_literal = false;
+    fn->is_jump_target = false;
     fn->literal_lines = NULL;
     fn->literal_count = 0;
     fn->section = NULL;
@@ -1576,6 +1578,7 @@ static bool cc_instruction_is_optimizer_barrier(const CCInstruction *ins)
     {
     case CC_INSTR_LABEL:
     case CC_INSTR_JUMP:
+    case CC_INSTR_JUMP_INDIRECT:
     case CC_INSTR_BRANCH:
     case CC_INSTR_RET:
     case CC_INSTR_CALL:
@@ -1688,6 +1691,7 @@ static bool cc_function_remove_dead_local_stores(CCFunction *fn)
 
             if (candidate->kind == CC_INSTR_LABEL ||
                 candidate->kind == CC_INSTR_JUMP ||
+                candidate->kind == CC_INSTR_JUMP_INDIRECT ||
                 candidate->kind == CC_INSTR_BRANCH)
             {
                 hit_barrier = true;
@@ -2326,6 +2330,7 @@ static bool cc_write_instruction(FILE *out, const CCInstruction *ins)
     case CC_INSTR_LABEL:
         return cc_write_string(out, ins->data.label.name);
     case CC_INSTR_JUMP:
+    case CC_INSTR_JUMP_INDIRECT:
         return cc_write_string(out, ins->data.jump.target);
     case CC_INSTR_BRANCH:
         if (!cc_write_string(out, ins->data.branch.true_target))

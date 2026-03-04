@@ -2700,6 +2700,28 @@ static bool emit_ret(X86FunctionContext *ctx, const CCInstruction *ins)
     return true;
 }
 
+static bool emit_jump_indirect(X86FunctionContext *ctx, const CCInstruction *ins)
+{
+    StackValue target;
+    if (!emit_pop_to_rax(ctx->out, ctx, &target))
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "jump_indirect requires target pointer");
+        return false;
+    }
+    (void)target;
+    if (ctx->stack_depth > 0)
+        x86_discard_eval_stack(ctx);
+    fprintf(ctx->out, "    mov r11, rax\n");
+    if (ctx->use_frame)
+        fprintf(ctx->out, "    leave\n");
+    fprintf(ctx->out, "    jmp r11\n");
+    ctx->stack_depth = 0;
+    ctx->stack_size = 0;
+    ctx->terminated = true;
+    ctx->saw_return = true;
+    return true;
+}
+
 static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     if (ctx->terminated && ins->kind != CC_INSTR_LABEL)
@@ -2781,6 +2803,8 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
             fprintf(ctx->out, "    jmp %s__%s\n", fn_symbol, ins->data.jump.target);
         }
         return true;
+    case CC_INSTR_JUMP_INDIRECT:
+        return emit_jump_indirect(ctx, ins);
     case CC_INSTR_BRANCH:
         return emit_branch(ctx, ins);
     case CC_INSTR_CALL:

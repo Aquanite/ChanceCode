@@ -1680,6 +1680,12 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 bslash_local_invalidate_all(ctx);
             break;
         }
+        case CC_INSTR_JUMP_INDIRECT:
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "jump_indirect is not supported by bslash backend");
+            success = false;
+            goto cleanup;
+        }
         case CC_INSTR_BRANCH:
         {
             if (!ins->data.branch.true_target || !ins->data.branch.false_target)

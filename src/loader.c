@@ -1451,13 +1451,20 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
                 break;
             }
             case CC_INSTR_JUMP:
+            case CC_INSTR_JUMP_INDIRECT:
             {
                 char *target = NULL;
-                if (!ccbin_read_cstring(file, &target, false))
+                bool allow_empty_target = (ins->kind == CC_INSTR_JUMP_INDIRECT);
+                if (!ccbin_read_cstring(file, &target, allow_empty_target))
                 {
                     if (sink)
                         cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid jump target in function index %zu", i);
                     goto fail;
+                }
+                if (allow_empty_target && target && target[0] == '\0')
+                {
+                    free(target);
+                    target = NULL;
                 }
                 ins->data.jump.target = target;
                 break;
@@ -2987,6 +2994,21 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
         return true;
     }
 
+    if (strcmp(mnemonic, "jump_indirect") == 0)
+    {
+        const char *target = strtok(NULL, " \t");
+        if (target)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "jump_indirect takes no operands");
+            return false;
+        }
+        ins = append_instruction(st, fn, CC_INSTR_JUMP_INDIRECT);
+        if (!ins)
+            return false;
+        ins->data.jump.target = NULL;
+        return true;
+    }
+
     if (strcmp(mnemonic, "branch") == 0)
     {
         const char *true_tok = strtok(NULL, " \t");
@@ -3624,6 +3646,10 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
                 else if (strcmp(token, "force-inline-literal") == 0)
                 {
                     current_fn->force_inline_literal = true;
+                }
+                else if (strcmp(token, "jump-target") == 0)
+                {
+                    current_fn->is_jump_target = true;
                 }
                 else if (strncmp(token, "section=", 8) == 0)
                 {

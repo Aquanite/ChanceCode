@@ -471,16 +471,28 @@ static size_t arm64_compute_max_stack_depth(const CCFunction *fn)
 				depth = 1;
 			break;
 		case CC_INSTR_CALL:
+		case CC_INSTR_CALL_INDIRECT:
 		{
 			size_t args = ins->data.call.arg_count;
 			if (depth >= args)
 				depth -= args;
 			else
 				depth = 0;
+			if (ins->kind == CC_INSTR_CALL_INDIRECT)
+			{
+				if (depth > 0)
+					depth -= 1;
+				else
+					depth = 0;
+			}
 			if (ins->data.call.return_type != CC_TYPE_VOID)
 				depth++;
 			break;
 		}
+		case CC_INSTR_JUMP_INDIRECT:
+			if (depth > 0)
+				depth--;
+			break;
 		case CC_INSTR_RET:
 			if (ins->data.ret.has_value && depth > 0)
 				depth--;
@@ -2083,6 +2095,32 @@ static bool arm64_emit_jump(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	return true;
 }
 
+static bool arm64_emit_jump_indirect(Arm64FunctionContext *ctx, const CCInstruction *ins)
+{
+	if (!ctx || !ctx->fn || !ins)
+		return false;
+	Arm64Value target;
+	if (!function_stack_pop(ctx, &target))
+	{
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "jump_indirect requires target pointer");
+		return false;
+	}
+	if (!arm64_spill_value_stack(ctx))
+		return false;
+	const char *target_reg = "x16";
+	if (!arm64_materialize_gp(ctx, &target, target_reg, false))
+		return false;
+	fprintf(ctx->out, "    mov sp, %s\n", ARM64_FRAME_REG);
+	if (ctx->frame_size > 0)
+		arm64_adjust_sp(ctx, ctx->frame_size, false);
+	fprintf(ctx->out, "    ldp %s, x28, [sp], #16\n", ARM64_FRAME_REG);
+	fprintf(ctx->out, "    ldp x29, x30, [sp], #16\n");
+	fprintf(ctx->out, "    br %s\n", target_reg);
+	ctx->stack_size = 0;
+	ctx->saw_return = true;
+	return true;
+}
+
 static bool arm64_emit_addr_param(Arm64FunctionContext *ctx, const CCInstruction *ins)
 {
 	uint32_t index = ins->data.param.index;
@@ -3372,6 +3410,8 @@ static bool arm64_emit_instruction(Arm64FunctionContext *ctx, const CCInstructio
 		return arm64_emit_label(ctx, ins);
 	case CC_INSTR_JUMP:
 		return arm64_emit_jump(ctx, ins);
+	case CC_INSTR_JUMP_INDIRECT:
+		return arm64_emit_jump_indirect(ctx, ins);
 	case CC_INSTR_BRANCH:
 		return arm64_emit_branch(ctx, ins);
 	case CC_INSTR_CALL:
