@@ -742,6 +742,285 @@ static bool cc_instruction_is_pure(const CCInstruction *ins)
     }
 }
 
+static bool cc_instruction_clone_local_value(CCInstruction *dst, const CCInstruction *src)
+{
+    if (!dst || !src)
+        return false;
+
+    memset(dst, 0, sizeof(*dst));
+    dst->kind = src->kind;
+
+    switch (src->kind)
+    {
+    case CC_INSTR_CONST:
+        dst->data.constant = src->data.constant;
+        return true;
+    case CC_INSTR_CONST_STRING:
+    {
+        size_t len = src->data.const_string.length;
+        if (len > 0)
+        {
+            dst->data.const_string.bytes = (char *)malloc(len);
+            if (!dst->data.const_string.bytes)
+                return false;
+            memcpy(dst->data.const_string.bytes, src->data.const_string.bytes, len);
+        }
+        dst->data.const_string.length = len;
+        dst->data.const_string.label_hint = cc_strdup(src->data.const_string.label_hint);
+        if (src->data.const_string.label_hint && !dst->data.const_string.label_hint)
+        {
+            cc_instruction_free(dst);
+            return false;
+        }
+        return true;
+    }
+    case CC_INSTR_LOAD_PARAM:
+    case CC_INSTR_ADDR_PARAM:
+        dst->data.param = src->data.param;
+        return true;
+    case CC_INSTR_ADDR_LOCAL:
+        dst->data.local = src->data.local;
+        return true;
+    case CC_INSTR_ADDR_GLOBAL:
+        dst->data.global.type = src->data.global.type;
+        dst->data.global.symbol = cc_strdup(src->data.global.symbol);
+        if (src->data.global.symbol && !dst->data.global.symbol)
+        {
+            cc_instruction_free(dst);
+            return false;
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool cc_instruction_is_clonable_local_value(const CCInstruction *ins)
+{
+    if (!ins)
+        return false;
+    switch (ins->kind)
+    {
+    case CC_INSTR_CONST:
+    case CC_INSTR_CONST_STRING:
+    case CC_INSTR_LOAD_PARAM:
+    case CC_INSTR_ADDR_PARAM:
+    case CC_INSTR_ADDR_LOCAL:
+    case CC_INSTR_ADDR_GLOBAL:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool cc_instruction_is_const_integer_value(const CCInstruction *ins, CCValueType type,
+                                                  unsigned long long expected)
+{
+    if (!ins || ins->kind != CC_INSTR_CONST || ins->data.constant.type != type)
+        return false;
+
+    unsigned bits = cc_value_type_bit_width(type);
+    if (bits == 0)
+        return ins->data.constant.value.u64 == expected;
+
+    unsigned long long mask = cc_mask_for_bits(bits);
+    return (ins->data.constant.value.u64 & mask) == (expected & mask);
+}
+
+static bool cc_instruction_is_const_all_ones(const CCInstruction *ins, CCValueType type)
+{
+    unsigned bits = cc_value_type_bit_width(type);
+    if (bits == 0)
+        return false;
+    return cc_instruction_is_const_integer_value(ins, type, cc_mask_for_bits(bits));
+}
+
+static bool cc_instruction_is_const_power_of_two(const CCInstruction *ins, CCValueType type,
+                                                 unsigned *shift_out)
+{
+    if (!ins || ins->kind != CC_INSTR_CONST || ins->data.constant.type != type)
+        return false;
+
+    unsigned bits = cc_value_type_bit_width(type);
+    if (bits == 0)
+        return false;
+
+    unsigned long long value = ins->data.constant.value.u64 & cc_mask_for_bits(bits);
+    if (value == 0ULL || (value & (value - 1ULL)) != 0ULL)
+        return false;
+
+    unsigned shift = 0;
+    while ((value >> shift) != 1ULL)
+        ++shift;
+    if (shift_out)
+        *shift_out = shift;
+    return true;
+}
+
+typedef struct
+{
+    bool known;
+    CCInstruction value;
+} CCLocalValueState;
+
+static void cc_local_value_state_reset(CCLocalValueState *state)
+{
+    if (!state)
+        return;
+    if (state->known)
+        cc_instruction_free(&state->value);
+    memset(state, 0, sizeof(*state));
+}
+
+static void cc_local_value_state_clear_all(CCLocalValueState *states, size_t count)
+{
+    if (!states)
+        return;
+    for (size_t i = 0; i < count; ++i)
+        cc_local_value_state_reset(&states[i]);
+}
+
+static bool cc_function_collect_promotable_locals(const CCFunction *fn, bool *promotable)
+{
+    if (!fn || !promotable)
+        return false;
+
+    for (size_t i = 0; i < fn->local_count; ++i)
+        promotable[i] = true;
+
+    for (size_t i = 0; i < fn->instruction_count; ++i)
+    {
+        const CCInstruction *ins = &fn->instructions[i];
+        if (ins->kind == CC_INSTR_ADDR_LOCAL && ins->data.local.index < fn->local_count)
+            promotable[ins->data.local.index] = false;
+    }
+
+    return true;
+}
+
+static bool cc_function_rewrite_store_load_pairs(CCFunction *fn, const bool *promotable)
+{
+    if (!fn || fn->instruction_count < 2)
+        return false;
+
+    bool changed = false;
+    for (size_t i = 0; i + 1 < fn->instruction_count; ++i)
+    {
+        CCInstruction *store = &fn->instructions[i];
+        CCInstruction *load = &fn->instructions[i + 1];
+        if (store->kind != CC_INSTR_STORE_LOCAL || load->kind != CC_INSTR_LOAD_LOCAL)
+            continue;
+
+        uint32_t local_index = store->data.local.index;
+        if (local_index != load->data.local.index || store->data.local.type != load->data.local.type)
+            continue;
+        if (promotable && local_index < fn->local_count && !promotable[local_index])
+            continue;
+
+        store->kind = CC_INSTR_DUP;
+        store->data.dup.type = load->data.local.type;
+        load->kind = CC_INSTR_STORE_LOCAL;
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool cc_function_promote_local_values(CCFunction *fn)
+{
+    if (!fn || fn->local_count == 0 || fn->instruction_count == 0)
+        return false;
+
+    bool *promotable = (bool *)calloc(fn->local_count, sizeof(bool));
+    CCLocalValueState *states = (CCLocalValueState *)calloc(fn->local_count, sizeof(CCLocalValueState));
+    if (!promotable || !states)
+    {
+        free(promotable);
+        free(states);
+        return false;
+    }
+
+    cc_function_collect_promotable_locals(fn, promotable);
+
+    bool changed = cc_function_rewrite_store_load_pairs(fn, promotable);
+
+    for (size_t i = 0; i < fn->instruction_count; ++i)
+    {
+        CCInstruction *ins = &fn->instructions[i];
+        switch (ins->kind)
+        {
+        case CC_INSTR_LOAD_LOCAL:
+        {
+            uint32_t index = ins->data.local.index;
+            if (index < fn->local_count && promotable[index] && states[index].known &&
+                states[index].value.kind != CC_INSTR_LOAD_LOCAL)
+            {
+                CCInstruction replacement;
+                memset(&replacement, 0, sizeof(replacement));
+                if (cc_instruction_clone_local_value(&replacement, &states[index].value))
+                {
+                    replacement.line = ins->line;
+                    replacement.debug_file = ins->debug_file;
+                    replacement.debug_line = ins->debug_line;
+                    replacement.debug_column = ins->debug_column;
+                    cc_instruction_free(ins);
+                    *ins = replacement;
+                    changed = true;
+                }
+            }
+            break;
+        }
+        case CC_INSTR_STORE_LOCAL:
+        {
+            uint32_t index = ins->data.local.index;
+            if (index >= fn->local_count || !promotable[index] || i == 0)
+            {
+                if (index < fn->local_count)
+                    cc_local_value_state_reset(&states[index]);
+                break;
+            }
+
+            CCInstruction *producer = &fn->instructions[i - 1];
+            if (!cc_instruction_is_clonable_local_value(producer))
+            {
+                cc_local_value_state_reset(&states[index]);
+                break;
+            }
+
+            CCInstruction cloned;
+            memset(&cloned, 0, sizeof(cloned));
+            if (!cc_instruction_clone_local_value(&cloned, producer))
+            {
+                cc_local_value_state_reset(&states[index]);
+                break;
+            }
+
+            cc_local_value_state_reset(&states[index]);
+            states[index].known = true;
+            states[index].value = cloned;
+            break;
+        }
+        case CC_INSTR_LABEL:
+        case CC_INSTR_JUMP:
+        case CC_INSTR_JUMP_INDIRECT:
+        case CC_INSTR_BRANCH:
+        case CC_INSTR_RET:
+        case CC_INSTR_CALL:
+        case CC_INSTR_CALL_INDIRECT:
+        case CC_INSTR_STORE_INDIRECT:
+            cc_local_value_state_clear_all(states, fn->local_count);
+            break;
+        default:
+            break;
+        }
+    }
+
+    cc_local_value_state_clear_all(states, fn->local_count);
+    free(states);
+    free(promotable);
+    return changed;
+}
+
 static void cc_function_remove_instructions(CCFunction *fn, size_t index, size_t count)
 {
     if (!fn || count == 0 || index >= fn->instruction_count)
@@ -1491,6 +1770,10 @@ static bool cc_function_simplify_binop_identities(CCFunction *fn)
 
         bool rhs_zero = (rhs->kind == CC_INSTR_CONST && rhs->data.constant.type == type && rhs->data.constant.value.u64 == 0ULL);
         bool lhs_zero = (lhs->kind == CC_INSTR_CONST && lhs->data.constant.type == type && lhs->data.constant.value.u64 == 0ULL);
+        bool rhs_one = cc_instruction_is_const_integer_value(rhs, type, 1ULL);
+        bool lhs_one = cc_instruction_is_const_integer_value(lhs, type, 1ULL);
+        bool rhs_all_ones = cc_instruction_is_const_all_ones(rhs, type);
+        bool lhs_all_ones = cc_instruction_is_const_all_ones(lhs, type);
 
         if (rhs_zero)
         {
@@ -1500,6 +1783,8 @@ static bool cc_function_simplify_binop_identities(CCFunction *fn)
             case CC_BINOP_SUB:
             case CC_BINOP_OR:
             case CC_BINOP_XOR:
+            case CC_BINOP_SHL:
+            case CC_BINOP_SHR:
                 cc_function_remove_instructions(fn, i + 1, 2);
                 changed = true;
                 continue;
@@ -1515,6 +1800,62 @@ static bool cc_function_simplify_binop_identities(CCFunction *fn)
             case CC_BINOP_ADD:
             case CC_BINOP_OR:
             case CC_BINOP_XOR:
+            case CC_BINOP_MUL:
+                cc_function_remove_instructions(fn, i + 2, 1);
+                cc_function_remove_instructions(fn, i, 1);
+                changed = true;
+                continue;
+            default:
+                break;
+            }
+        }
+
+        if (rhs_one)
+        {
+            switch (bin->data.binop.op)
+            {
+            case CC_BINOP_MUL:
+            case CC_BINOP_DIV:
+                cc_function_remove_instructions(fn, i + 1, 2);
+                changed = true;
+                continue;
+            default:
+                break;
+            }
+        }
+
+        if (lhs_one)
+        {
+            switch (bin->data.binop.op)
+            {
+            case CC_BINOP_MUL:
+                cc_function_remove_instructions(fn, i + 2, 1);
+                cc_function_remove_instructions(fn, i, 1);
+                changed = true;
+                continue;
+            default:
+                break;
+            }
+        }
+
+        if (rhs_all_ones)
+        {
+            switch (bin->data.binop.op)
+            {
+            case CC_BINOP_AND:
+                cc_function_remove_instructions(fn, i + 1, 2);
+                changed = true;
+                continue;
+            default:
+                break;
+            }
+        }
+
+        if (lhs_all_ones)
+        {
+            switch (bin->data.binop.op)
+            {
+            case CC_BINOP_AND:
                 cc_function_remove_instructions(fn, i + 2, 1);
                 cc_function_remove_instructions(fn, i, 1);
                 changed = true;
@@ -1525,6 +1866,67 @@ static bool cc_function_simplify_binop_identities(CCFunction *fn)
         }
 
         ++i;
+    }
+
+    return changed;
+}
+
+static bool cc_function_strength_reduce_binops(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    for (size_t i = 0; i + 2 < fn->instruction_count; ++i)
+    {
+        CCInstruction *lhs = &fn->instructions[i];
+        CCInstruction *rhs = &fn->instructions[i + 1];
+        CCInstruction *bin = &fn->instructions[i + 2];
+
+        if (bin->kind != CC_INSTR_BINOP)
+            continue;
+
+        CCValueType type = bin->data.binop.type;
+        if (!cc_value_type_is_integer(type) || rhs->kind != CC_INSTR_CONST || rhs->data.constant.type != type)
+            continue;
+
+        unsigned shift = 0;
+        bool is_unsigned = bin->data.binop.is_unsigned || !cc_value_type_is_signed(type);
+        if (bin->data.binop.op == CC_BINOP_MUL && cc_instruction_is_const_power_of_two(rhs, type, &shift) && shift > 0)
+        {
+            rhs->data.constant.value.u64 = shift;
+            rhs->data.constant.value.i64 = (long long)shift;
+            rhs->data.constant.is_unsigned = true;
+            rhs->data.constant.is_null = false;
+            bin->data.binop.op = CC_BINOP_SHL;
+            changed = true;
+            continue;
+        }
+
+        if (is_unsigned && bin->data.binop.op == CC_BINOP_DIV &&
+            cc_instruction_is_const_power_of_two(rhs, type, &shift) && shift > 0)
+        {
+            rhs->data.constant.value.u64 = shift;
+            rhs->data.constant.value.i64 = (long long)shift;
+            rhs->data.constant.is_unsigned = true;
+            rhs->data.constant.is_null = false;
+            bin->data.binop.op = CC_BINOP_SHR;
+            changed = true;
+            continue;
+        }
+
+        if (is_unsigned && bin->data.binop.op == CC_BINOP_MOD &&
+            cc_instruction_is_const_power_of_two(rhs, type, &shift) && shift > 0)
+        {
+            unsigned bits = cc_value_type_bit_width(type);
+            unsigned long long mask = (shift >= bits) ? cc_mask_for_bits(bits) : ((1ULL << shift) - 1ULL);
+            rhs->data.constant.value.u64 = mask;
+            rhs->data.constant.value.i64 = (long long)mask;
+            rhs->data.constant.is_unsigned = true;
+            rhs->data.constant.is_null = (mask == 0ULL);
+            bin->data.binop.op = CC_BINOP_AND;
+            changed = true;
+        }
     }
 
     return changed;
@@ -1565,6 +1967,29 @@ static bool cc_function_remove_redundant_bitcast_pairs(CCFunction *fn)
         }
 
         ++i;
+    }
+
+    return changed;
+}
+
+static bool cc_function_remove_redundant_converts(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i < fn->instruction_count)
+    {
+        CCInstruction *ins = &fn->instructions[i];
+        if (ins->kind != CC_INSTR_CONVERT || ins->data.convert.from_type != ins->data.convert.to_type)
+        {
+            ++i;
+            continue;
+        }
+
+        cc_function_remove_instructions(fn, i, 1);
+        changed = true;
     }
 
     return changed;
@@ -1978,11 +2403,15 @@ void cc_module_optimize(CCModule *module, int opt_level)
             {
                 if (cc_function_simplify_binop_identities(fn))
                     progress = true;
+                if (cc_function_strength_reduce_binops(fn))
+                    progress = true;
                 if (cc_function_fold_const_binops(fn))
                     progress = true;
                 if (cc_function_fold_const_unops(fn))
                     progress = true;
                 if (cc_function_fold_const_converts(fn))
+                    progress = true;
+                if (cc_function_remove_redundant_converts(fn))
                     progress = true;
                 if (cc_function_remove_redundant_bitcast_pairs(fn))
                     progress = true;
@@ -1997,6 +2426,8 @@ void cc_module_optimize(CCModule *module, int opt_level)
             }
             if (opt_level >= 3)
             {
+                if (cc_function_promote_local_values(fn))
+                    progress = true;
                 if (cc_function_propagate_local_values(fn))
                     progress = true;
                 if (cc_function_remove_dead_local_stores(fn))
