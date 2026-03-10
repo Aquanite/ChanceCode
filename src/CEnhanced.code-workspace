@@ -1,12 +1,19 @@
 {
 	"folders": [
 		{
+			"name": "CEnhanced",
 			"path": "../../CEnhanced"
 		},
 		{
+			"name": "ChanceCode",
 			"path": ".."
 		},
 		{
+			"name": "CHS",
+			"path": "../../CHS"
+		},
+		{
+			"name": "CLD",
 			"path": "../../CLD"
 		}
 	],

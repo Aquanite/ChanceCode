@@ -13,7 +13,17 @@ void cc_register_builtin_backends(void);
 
 static void print_usage(void)
 {
-    fprintf(stderr, "Usage: ccb <input.ccb> [-O0|-O1|-O2|-O3] [--backend NAME] [--output PATH] [--option key=value] [--list-backends] [--emit-ccbin PATH] [--strip] [--strip-hard] [--obfuscate]\n");
+    fprintf(stderr, "Usage: ccb <input.ccb> [-O0|-O1|-O2|-O3] [--backend NAME] [--output PATH] [--option key=value] [--list-backends] [--emit-ccbin PATH] [--strip] [--strip-hard] [--obfuscate] [-d|-vd]\n");
+}
+
+static void print_debug_header(void)
+{
+    fprintf(stderr, "\n[debug] Configuration\n");
+}
+
+static void print_debug_row(const char *key, const char *value)
+{
+    fprintf(stderr, "  %-16s : %s\n", key, value ? value : "-");
 }
 
 static bool parse_option_assignment(const char *arg, CCBackendOption *out_option)
@@ -275,6 +285,8 @@ int main(int argc, char **argv)
     bool strip_metadata = false;
     bool strip_hard = false;
     bool obfuscate = false;
+    bool debug_enabled = false;
+    bool debug_deep = false;
     int opt_level = 0;
 
     CCBackendOption option_storage[16];
@@ -352,6 +364,15 @@ int main(int argc, char **argv)
             }
             ++option_count;
         }
+        else if (strcmp(arg, "-d") == 0 || strcmp(arg, "--debug") == 0)
+        {
+            debug_enabled = true;
+        }
+        else if (strcmp(arg, "-vd") == 0 || strcmp(arg, "--verbose-deep") == 0)
+        {
+            debug_enabled = true;
+            debug_deep = true;
+        }
         else if (strncmp(arg, "-O", 2) == 0)
         {
             const char *level_str = arg + 2;
@@ -409,6 +430,36 @@ int main(int argc, char **argv)
     }
 
     cc_register_builtin_backends();
+
+    if (debug_enabled)
+    {
+        char opt_level_buf[8];
+        snprintf(opt_level_buf, sizeof(opt_level_buf), "-O%d", opt_level);
+        print_debug_header();
+        print_debug_row("Input", input_path ? input_path : "(none)");
+        print_debug_row("Backend", backend_name ? backend_name : "(auto)");
+        print_debug_row("Output", output_path ? output_path : "(none)");
+        print_debug_row("Emit CCBIN", ccbin_path ? ccbin_path : "no");
+        print_debug_row("Optimization", opt_level_buf);
+        print_debug_row("Strip", strip_metadata ? "yes" : "no");
+        print_debug_row("Strip hard", strip_hard ? "yes" : "no");
+        print_debug_row("Obfuscate", obfuscate ? "yes" : "no");
+        print_debug_row("List backends", list_backends ? "yes" : "no");
+        if (debug_deep)
+        {
+            char option_count_buf[16];
+            snprintf(option_count_buf, sizeof(option_count_buf), "%zu", option_count);
+            print_debug_row("Deep mode", "enabled");
+            print_debug_row("Backend options", option_count_buf);
+            for (size_t i = 0; i < option_count; ++i)
+            {
+                fprintf(stderr, "    option[%zu]        = %s=%s\n",
+                        i,
+                        option_storage[i].key ? option_storage[i].key : "",
+                        option_storage[i].value ? option_storage[i].value : "");
+            }
+        }
+    }
 
     if (list_backends)
     {
