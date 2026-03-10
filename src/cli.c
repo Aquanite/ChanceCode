@@ -297,7 +297,7 @@ int main(int argc, char **argv)
         const char *arg = argv[i];
         if (strcmp(arg, "--version") == 0)
         {
-            printf("ccb: ChanceCode Compiler version 1.0.0\n");
+            printf("ccb: ChanceCode Compiler version 1.3.0\n");
             printf("ccb: CCB language standard: CC3-4\n");
             printf("ccb: License: OpenAzure License\n");
             printf("ccb: Compiled on %s %s\n", __DATE__, __TIME__);
