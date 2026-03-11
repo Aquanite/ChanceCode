@@ -1818,7 +1818,17 @@ static bool arm64_handle_label_entry(Arm64FunctionContext *ctx, size_t line, con
 {
 	Arm64StackSnapshot *snapshot = arm64_find_stack_snapshot(ctx, label);
 	if (snapshot)
+	{
+		/*
+		 * Different predecessors may reach the same label with different stack
+		 * values but identical stack depth. Spill the current fallthrough values
+		 * into the canonical per-depth temp slots before re-applying the recorded
+		 * snapshot so merged stack values remain path-correct.
+		 */
+		if (snapshot->value_count == ctx->stack_size && !arm64_spill_value_stack(ctx))
+			return false;
 		return arm64_apply_stack_snapshot(ctx, snapshot);
+	}
 	if (!arm64_spill_value_stack(ctx))
 		return false;
 	return arm64_record_stack_snapshot(ctx, line, label);
