@@ -1371,14 +1371,14 @@ static bool arm64_adjust_sp(Arm64FunctionContext *ctx, size_t amount, bool subtr
 	if (!ctx || amount == 0)
 		return true;
 	FILE *out = ctx->out;
-	if (amount <= 4095)
+	while (amount > 0)
 	{
-		fprintf(out, "    %s sp, sp, #%zu\n", subtract ? "sub" : "add", amount);
-		return true;
+		size_t chunk = amount;
+		if (chunk > 4095)
+			chunk = 4080;
+		fprintf(out, "    %s sp, sp, #%zu\n", subtract ? "sub" : "add", chunk);
+		amount -= chunk;
 	}
-	const char *tmp_reg = ARM64_SCRATCH_GP_REGS64[0];
-	arm64_mov_imm(out, tmp_reg, false, amount);
-	fprintf(out, "    %s sp, sp, %s\n", subtract ? "sub" : "add", tmp_reg);
 	return true;
 }
 
