@@ -1788,6 +1788,11 @@ static bool cc_function_simplify_binop_identities(CCFunction *fn)
                 cc_function_remove_instructions(fn, i + 1, 2);
                 changed = true;
                 continue;
+            case CC_BINOP_MUL:
+                cc_function_remove_instructions(fn, i + 2, 1);
+                cc_function_remove_instructions(fn, i, 1);
+                changed = true;
+                continue;
             default:
                 break;
             }
@@ -1800,9 +1805,12 @@ static bool cc_function_simplify_binop_identities(CCFunction *fn)
             case CC_BINOP_ADD:
             case CC_BINOP_OR:
             case CC_BINOP_XOR:
-            case CC_BINOP_MUL:
                 cc_function_remove_instructions(fn, i + 2, 1);
                 cc_function_remove_instructions(fn, i, 1);
+                changed = true;
+                continue;
+            case CC_BINOP_MUL:
+                cc_function_remove_instructions(fn, i + 1, 2);
                 changed = true;
                 continue;
             default:
@@ -2401,8 +2409,6 @@ void cc_module_optimize(CCModule *module, int opt_level)
                 progress = true;
             if (opt_level >= 2)
             {
-                if (cc_function_simplify_binop_identities(fn))
-                    progress = true;
                 if (cc_function_strength_reduce_binops(fn))
                     progress = true;
                 if (cc_function_fold_const_binops(fn))
