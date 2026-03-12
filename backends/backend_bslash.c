@@ -28,19 +28,6 @@ typedef struct
 
 typedef struct
 {
-    char *label;
-    size_t size_bytes;
-} BSlashDataSlot;
-
-typedef struct
-{
-    BSlashDataSlot *items;
-    size_t count;
-    size_t capacity;
-} BSlashDataTable;
-
-typedef struct
-{
     char *buffer;
     size_t size;
     bool needed;
@@ -79,12 +66,13 @@ typedef struct
     bool reg_in_use[BSLASH_VALUE_STACK_CAPACITY];
     bool reg_reserved[BSLASH_VALUE_STACK_CAPACITY];
     BSlashRegisterInfo reg_info[BSLASH_VALUE_STACK_CAPACITY];
-    BSlashDataTable *locals_table;
     char **local_labels;
     bool *local_needs_memory;
     const char **local_registers;
     int *local_register_indices;
     size_t local_count;
+    size_t *local_offsets;
+    size_t frame_size_bytes;
     bool *local_known_values;
     uint32_t *local_known_u32;
     bool *local_known_ptr;
@@ -98,10 +86,13 @@ typedef struct
 static const char *bslash_require_local_storage(BSlashFunctionContext *ctx, size_t index);
 static int bslash_local_index_from_label(BSlashFunctionContext *ctx, const char *label);
 static bool bslash_stack_push_new(BSlashFunctionContext *ctx, size_t line, const char **out_reg);
+static void bslash_emit_addi(BSlashFunctionContext *ctx, const char *dst, int32_t value);
 
 static bool bslash_emit_simple_param_add(FILE *out, const CCFunction *fn)
 {
     if (!out || !fn || !fn->instructions)
+        return false;
+    if (fn->is_noreturn)
         return false;
     if (fn->instruction_count != 4)
         return false;
@@ -118,6 +109,44 @@ static bool bslash_emit_simple_param_add(FILE *out, const CCFunction *fn)
     if (ret->kind != CC_INSTR_RET || !ret->data.ret.has_value)
         return false;
     fprintf(out, "    ADD B0, B1\n");
+    fprintf(out, "    RET\n\n");
+    return true;
+}
+
+static bool bslash_emit_simple_param_addi(FILE *out, const CCFunction *fn)
+{
+    if (!out || !fn || !fn->instructions)
+        return false;
+    if (fn->is_noreturn)
+        return false;
+    if (fn->instruction_count != 4)
+        return false;
+    const CCInstruction *load_param = &fn->instructions[0];
+    const CCInstruction *constant = &fn->instructions[1];
+    const CCInstruction *binop = &fn->instructions[2];
+    const CCInstruction *ret = &fn->instructions[3];
+    if (load_param->kind != CC_INSTR_LOAD_PARAM || load_param->data.param.index != 0)
+        return false;
+    if (constant->kind != CC_INSTR_CONST || constant->data.constant.is_null)
+        return false;
+    if (binop->kind != CC_INSTR_BINOP || binop->data.binop.op != CC_BINOP_ADD)
+        return false;
+    if (ret->kind != CC_INSTR_RET || !ret->data.ret.has_value)
+        return false;
+
+    int64_t imm = constant->data.constant.value.i64;
+    if (imm >= -128 && imm <= 127)
+    {
+        fprintf(out, "    ADDI8 B0, #0x%02" PRIx32 "\n", (uint32_t)((int32_t)imm & 0xFF));
+    }
+    else if (imm >= -32768 && imm <= 32767)
+    {
+        fprintf(out, "    ADDI16 B0, #0x%04" PRIx32 "\n", (uint32_t)((int32_t)imm & 0xFFFF));
+    }
+    else
+    {
+        fprintf(out, "    ADDI32 B0, #0x%08" PRIx32 "\n", (uint32_t)((int32_t)imm));
+    }
     fprintf(out, "    RET\n\n");
     return true;
 }
@@ -173,53 +202,6 @@ static bool bslash_string_table_reserve(BSlashStringTable *table, size_t desired
     table->items = items;
     table->capacity = new_capacity;
     return true;
-}
-
-static void bslash_data_table_destroy(BSlashDataTable *table)
-{
-    if (!table)
-        return;
-    for (size_t i = 0; i < table->count; ++i)
-        free(table->items[i].label);
-    free(table->items);
-    table->items = NULL;
-    table->count = 0;
-    table->capacity = 0;
-}
-
-static bool bslash_data_table_reserve(BSlashDataTable *table, size_t desired)
-{
-    if (table->capacity >= desired)
-        return true;
-    size_t new_capacity = table->capacity ? table->capacity * 2 : 8;
-    while (new_capacity < desired)
-        new_capacity *= 2;
-    BSlashDataSlot *items = (BSlashDataSlot *)realloc(table->items, new_capacity * sizeof(BSlashDataSlot));
-    if (!items)
-        return false;
-    table->items = items;
-    table->capacity = new_capacity;
-    return true;
-}
-
-static const char *bslash_data_table_add(BSlashDataTable *table, const char *label, size_t size_bytes)
-{
-    if (!table || !label)
-        return NULL;
-    for (size_t i = 0; i < table->count; ++i)
-    {
-        if (strcmp(table->items[i].label, label) == 0)
-            return table->items[i].label;
-    }
-    if (!bslash_data_table_reserve(table, table->count + 1))
-        return NULL;
-    char *label_copy = bslash_strdup(label);
-    if (!label_copy)
-        return NULL;
-    BSlashDataSlot *slot = &table->items[table->count++];
-    slot->label = label_copy;
-    slot->size_bytes = size_bytes;
-    return slot->label;
 }
 
 static const char *bslash_register_string_literal(BSlashStringTable *table, const CCFunction *fn, const CCInstruction *ins, size_t *counter)
@@ -480,6 +462,40 @@ static const char *bslash_get_register_label(const BSlashFunctionContext *ctx, c
     return ctx->reg_info[idx].label;
 }
 
+static size_t bslash_align_up(size_t value, size_t alignment)
+{
+    if (alignment == 0)
+        return value;
+    size_t remainder = value % alignment;
+    if (remainder == 0)
+        return value;
+    return value + (alignment - remainder);
+}
+
+static size_t bslash_local_type_size(CCValueType type)
+{
+    switch (type)
+    {
+    case CC_TYPE_I1:
+    case CC_TYPE_I8:
+    case CC_TYPE_U8:
+        return 1;
+    case CC_TYPE_I16:
+    case CC_TYPE_U16:
+        return 2;
+    case CC_TYPE_I64:
+    case CC_TYPE_U64:
+    case CC_TYPE_F64:
+        return 8;
+    case CC_TYPE_PTR:
+        return 4;
+    case CC_TYPE_VOID:
+        return 0;
+    default:
+        return 4;
+    }
+}
+
 static void bslash_ensure_register_materialized(BSlashFunctionContext *ctx, const char *reg)
 {
     if (!ctx || !reg)
@@ -495,11 +511,13 @@ static void bslash_ensure_register_materialized(BSlashFunctionContext *ctx, cons
         int local_idx = bslash_local_index_from_label(ctx, label);
         if (local_idx >= 0)
         {
-            const char *stored = bslash_require_local_storage(ctx, (size_t)local_idx);
-            if (!stored)
+            if (!ctx->local_offsets || (size_t)local_idx >= ctx->local_count || ctx->local_offsets[local_idx] == 0)
                 return;
-            label = stored;
-            ctx->reg_info[idx].label = stored;
+            fprintf(ctx->out, "    RDFR %s\n", reg);
+            bslash_clear_register_info(ctx, reg);
+            bslash_emit_addi(ctx, reg, -(int32_t)ctx->local_offsets[local_idx]);
+            bslash_set_register_label(ctx, reg, label, true);
+            return;
         }
         bslash_emit_movi32_label(ctx, reg, label);
     }
@@ -511,6 +529,32 @@ static void bslash_emit_mov(BSlashFunctionContext *ctx, const char *dst, const c
         return;
     if (strcmp(dst, src) == 0)
         return;
+    int src_idx = bslash_register_index(src);
+    if (src_idx >= 0)
+    {
+        if (ctx->reg_info[src_idx].is_const && !ctx->reg_info[src_idx].materialized)
+        {
+            bslash_emit_movi32_u32(ctx, dst, ctx->reg_info[src_idx].const_value);
+            return;
+        }
+        if (ctx->reg_info[src_idx].label && !ctx->reg_info[src_idx].materialized)
+        {
+            const char *label = ctx->reg_info[src_idx].label;
+            int local_idx = bslash_local_index_from_label(ctx, label);
+            if (local_idx >= 0)
+            {
+                if (!ctx->local_offsets || (size_t)local_idx >= ctx->local_count || ctx->local_offsets[local_idx] == 0)
+                    return;
+                fprintf(ctx->out, "    RDFR %s\n", dst);
+                bslash_clear_register_info(ctx, dst);
+                bslash_emit_addi(ctx, dst, -(int32_t)ctx->local_offsets[local_idx]);
+                bslash_set_register_label(ctx, dst, label, true);
+                return;
+            }
+            bslash_emit_movi32_label(ctx, dst, label);
+            return;
+        }
+    }
     bslash_ensure_register_materialized(ctx, src);
     fprintf(ctx->out, "    MOV %s, %s\n", dst, src);
     bslash_copy_register_info(ctx, dst, src);
@@ -522,20 +566,39 @@ static void bslash_emit_addi(BSlashFunctionContext *ctx, const char *dst, int32_
         return;
     uint32_t previous = 0;
     bool had_const = bslash_get_register_const(ctx, dst, &previous);
-    if (value >= -128 && value <= 127)
+    if (value >= 0)
     {
-        uint32_t encoded = (uint32_t)(value & 0xFF);
-        fprintf(ctx->out, "    ADDI8 %s, #0x%02" PRIx32 "\n", dst, encoded);
-    }
-    else if (value >= -32768 && value <= 32767)
-    {
-        uint32_t encoded = (uint32_t)(value & 0xFFFF);
-        fprintf(ctx->out, "    ADDI16 %s, #0x%04" PRIx32 "\n", dst, encoded);
+        if (value <= 127)
+        {
+            uint32_t encoded = (uint32_t)value;
+            fprintf(ctx->out, "    ADDI8 %s, #0x%02" PRIx32 "\n", dst, encoded);
+        }
+        else if (value <= 32767)
+        {
+            uint32_t encoded = (uint32_t)value;
+            fprintf(ctx->out, "    ADDI16 %s, #0x%04" PRIx32 "\n", dst, encoded);
+        }
+        else
+        {
+            uint32_t encoded = (uint32_t)value;
+            fprintf(ctx->out, "    ADDI32 %s, #0x%08" PRIx32 "\n", dst, encoded);
+        }
     }
     else
     {
-        uint32_t encoded = (uint32_t)value;
-        fprintf(ctx->out, "    ADDI32 %s, #0x%08" PRIx32 "\n", dst, encoded);
+        uint32_t magnitude = (uint32_t)(-(int64_t)value);
+        if (magnitude <= 127)
+        {
+            fprintf(ctx->out, "    SUBI8 %s, #0x%02" PRIx32 "\n", dst, magnitude);
+        }
+        else if (magnitude <= 32767)
+        {
+            fprintf(ctx->out, "    SUBI16 %s, #0x%04" PRIx32 "\n", dst, magnitude);
+        }
+        else
+        {
+            fprintf(ctx->out, "    SUBI32 %s, #0x%08" PRIx32 "\n", dst, magnitude);
+        }
     }
     if (had_const)
     {
@@ -666,6 +729,47 @@ static bool bslash_prepare_locals(BSlashFunctionContext *ctx, const CCFunction *
         }
     }
 
+    return true;
+}
+
+static bool bslash_prepare_frame_layout(BSlashFunctionContext *ctx, const CCFunction *fn)
+{
+    if (!ctx)
+        return false;
+    ctx->frame_size_bytes = 0;
+    if (ctx->local_count == 0)
+        return true;
+
+    ctx->local_offsets = (size_t *)calloc(ctx->local_count, sizeof(size_t));
+    if (!ctx->local_offsets)
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "out of memory allocating local frame map");
+        return false;
+    }
+
+    size_t cursor = 0;
+    for (size_t i = 0; i < ctx->local_count; ++i)
+    {
+        if (!ctx->local_needs_memory || !ctx->local_needs_memory[i])
+            continue;
+        CCValueType type = (fn && fn->local_types && i < fn->local_count)
+                               ? fn->local_types[i]
+                               : CC_TYPE_I32;
+        size_t size_bytes = bslash_local_type_size(type);
+        if (size_bytes == 0)
+            size_bytes = 4;
+        size_t alignment = size_bytes >= 8 ? 8 : 4;
+        cursor = bslash_align_up(cursor, alignment);
+        cursor += size_bytes;
+        ctx->local_offsets[i] = cursor;
+    }
+
+    ctx->frame_size_bytes = bslash_align_up(cursor, 4);
+    if (ctx->frame_size_bytes > 0xFFFFu)
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "stack frame too large for ENTERI16 (%zu bytes)", ctx->frame_size_bytes);
+        return false;
+    }
     return true;
 }
 
@@ -1056,6 +1160,8 @@ static void bslash_function_cleanup(BSlashFunctionContext *ctx)
     ctx->local_registers = NULL;
     free(ctx->local_register_indices);
     ctx->local_register_indices = NULL;
+    free(ctx->local_offsets);
+    ctx->local_offsets = NULL;
     free(ctx->local_known_values);
     ctx->local_known_values = NULL;
     free(ctx->local_known_u32);
@@ -1114,21 +1220,14 @@ static const char *bslash_require_local_storage(BSlashFunctionContext *ctx, size
         emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "storage requested for register-only local %zu", index);
         return NULL;
     }
-    const char *label = bslash_get_local_label_name(ctx, index);
-    if (!label)
-        return NULL;
-    if (ctx->local_storage_registered && ctx->local_storage_registered[index])
-        return ctx->local_labels[index];
-    const char *registered = bslash_data_table_add(ctx->locals_table, label, 4);
-    if (!registered)
+    if (!ctx->local_offsets || ctx->local_offsets[index] == 0)
     {
-        emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "failed to allocate storage for local %zu", index);
+        emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "stack slot missing for local %zu", index);
         return NULL;
     }
     if (ctx->local_storage_registered)
         ctx->local_storage_registered[index] = true;
-    ctx->local_labels[index] = (char *)registered;
-    return ctx->local_labels[index];
+    return bslash_get_local_label_name(ctx, index);
 }
 
 static int bslash_local_index_from_label(BSlashFunctionContext *ctx, const char *label)
@@ -1283,14 +1382,14 @@ static bool bslash_local_materialize(BSlashFunctionContext *ctx, size_t index, s
         return true;
     if (!ctx->local_materialized || ctx->local_materialized[index])
         return true;
-    const char *label = bslash_require_local_storage(ctx, index);
-    if (!label)
+    if (!bslash_require_local_storage(ctx, index))
         return false;
     const char *addr_reg = bslash_scratch_acquire(ctx, line);
     if (!addr_reg)
         return false;
-    bslash_emit_movi32_label(ctx, addr_reg, label);
-    bslash_ensure_register_materialized(ctx, addr_reg);
+    fprintf(ctx->out, "    RDFR %s\n", addr_reg);
+    bslash_clear_register_info(ctx, addr_reg);
+    bslash_emit_addi(ctx, addr_reg, -(int32_t)ctx->local_offsets[index]);
     const char *value_reg = bslash_scratch_acquire(ctx, line);
     if (!value_reg)
     {
@@ -1354,6 +1453,8 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
     ctx->local_needs_memory = NULL;
     ctx->local_registers = NULL;
     ctx->local_register_indices = NULL;
+    ctx->local_offsets = NULL;
+    ctx->frame_size_bytes = 0;
     ctx->local_known_values = NULL;
     ctx->local_known_u32 = NULL;
     ctx->local_known_ptr = NULL;
@@ -1387,10 +1488,16 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             success = false;
             goto cleanup;
         }
+        if (!bslash_prepare_frame_layout(ctx, fn))
+        {
+            success = false;
+            goto cleanup;
+        }
     }
     else
     {
         ctx->local_labels = NULL;
+        ctx->local_offsets = NULL;
         ctx->local_known_values = NULL;
         ctx->local_known_u32 = NULL;
         ctx->local_known_ptr = NULL;
@@ -1401,6 +1508,9 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
 
     fprintf(ctx->out, "%s:\n", fn->name);
 
+    if (ctx->frame_size_bytes > 0)
+        fprintf(ctx->out, "    ENTERI16 #0x%04zx\n", ctx->frame_size_bytes);
+
     if (fn->is_literal)
     {
         for (size_t li = 0; li < fn->literal_count; ++li)
@@ -1410,8 +1520,12 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         goto cleanup;
     }
 
-    if (ctx->opt_level > 0 && bslash_emit_simple_param_add(ctx->out, fn))
-        goto cleanup;
+    if (ctx->opt_level > 0)
+    {
+        if (bslash_emit_simple_param_add(ctx->out, fn) ||
+            bslash_emit_simple_param_addi(ctx->out, fn))
+            goto cleanup;
+    }
 
     bool emitted_return = false;
 
@@ -1518,8 +1632,7 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 bslash_release_register(ctx, value);
                 break;
             }
-            const char *label = bslash_require_local_storage(ctx, ins->data.local.index);
-            if (!label)
+            if (!bslash_require_local_storage(ctx, ins->data.local.index))
             {
                 bslash_release_register(ctx, value);
                 success = false;
@@ -1537,8 +1650,9 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             }
             if (ctx->opt_level > 0)
             {
-                bslash_emit_movi32_label(ctx, scratch, label);
-                bslash_ensure_register_materialized(ctx, scratch);
+                fprintf(ctx->out, "    RDFR %s\n", scratch);
+                bslash_clear_register_info(ctx, scratch);
+                bslash_emit_addi(ctx, scratch, -(int32_t)ctx->local_offsets[local_index]);
                 bslash_ensure_register_materialized(ctx, value);
                 fprintf(ctx->out, "    ST [%s], %s\n", scratch, value);
                 bslash_scratch_release(ctx);
@@ -1546,7 +1660,9 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             else
             {
                 fprintf(ctx->out, "    PUSHR B1\n");
-                bslash_emit_movi32_label(ctx, "B1", label);
+                fprintf(ctx->out, "    RDFR B1\n");
+                bslash_clear_register_info(ctx, "B1");
+                bslash_emit_addi(ctx, "B1", -(int32_t)ctx->local_offsets[local_index]);
                 bslash_ensure_register_materialized(ctx, value);
                 fprintf(ctx->out, "    ST [B1], %s\n", value);
                 fprintf(ctx->out, "    POPR B1\n");
@@ -1592,8 +1708,7 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     goto cleanup;
                 }
             }
-            const char *label = bslash_require_local_storage(ctx, ins->data.local.index);
-            if (!label)
+            if (!bslash_require_local_storage(ctx, ins->data.local.index))
             {
                 success = false;
                 goto cleanup;
@@ -1606,15 +1721,18 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     success = false;
                     goto cleanup;
                 }
-                bslash_emit_movi32_label(ctx, scratch, label);
-                bslash_ensure_register_materialized(ctx, scratch);
+                fprintf(ctx->out, "    RDFR %s\n", scratch);
+                bslash_clear_register_info(ctx, scratch);
+                bslash_emit_addi(ctx, scratch, -(int32_t)ctx->local_offsets[local_index]);
                 fprintf(ctx->out, "    LD %s, [%s]\n", dst, scratch);
                 bslash_scratch_release(ctx);
             }
             else
             {
                 fprintf(ctx->out, "    PUSHR B1\n");
-                bslash_emit_movi32_label(ctx, "B1", label);
+                fprintf(ctx->out, "    RDFR B1\n");
+                bslash_clear_register_info(ctx, "B1");
+                bslash_emit_addi(ctx, "B1", -(int32_t)ctx->local_offsets[local_index]);
                 fprintf(ctx->out, "    LD %s, [B1]\n", dst);
                 fprintf(ctx->out, "    POPR B1\n");
             }
@@ -1655,6 +1773,29 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             }
             break;
         }
+        case CC_INSTR_ADDR_GLOBAL:
+        {
+            const char *symbol = ins->data.global.symbol;
+            if (!symbol || !symbol[0])
+            {
+                emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "addr_global missing symbol");
+                success = false;
+                goto cleanup;
+            }
+            const char *dst = NULL;
+            if (!bslash_stack_push_new(ctx, ins->line, &dst))
+            {
+                success = false;
+                goto cleanup;
+            }
+            if (bslash_find_function(ctx->module, symbol))
+                bslash_mark_function_needed(ctx, symbol);
+            if (ctx->opt_level >= 3)
+                bslash_set_register_label(ctx, dst, symbol, false);
+            else
+                bslash_emit_movi32_label(ctx, dst, symbol);
+            break;
+        }
         case CC_INSTR_LABEL:
         {
             if (ins->data.label.name && ins->data.label.name[0])
@@ -1682,9 +1823,21 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         }
         case CC_INSTR_JUMP_INDIRECT:
         {
-            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "jump_indirect is not supported by bslash backend");
-            success = false;
-            goto cleanup;
+            const char *target = bslash_stack_pop(ctx, ins->line);
+            if (!target)
+            {
+                success = false;
+                goto cleanup;
+            }
+            bslash_ensure_register_materialized(ctx, target);
+            if (ctx->frame_size_bytes > 0)
+                fprintf(ctx->out, "    LEAVE\n");
+            fprintf(ctx->out, "    JR %s\n", target);
+            bslash_release_register(ctx, target);
+            bslash_stack_reset(ctx);
+            if (ctx->opt_level >= 3)
+                bslash_local_invalidate_all(ctx);
+            break;
         }
         case CC_INSTR_BRANCH:
         {
@@ -2032,7 +2185,12 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     bslash_emit_mov(ctx, "B0", value);
                 bslash_release_register(ctx, value);
             }
-            fprintf(ctx->out, "    RET\n");
+            if (!fn->is_noreturn)
+            {
+                if (ctx->frame_size_bytes > 0)
+                    fprintf(ctx->out, "    LEAVE\n");
+                fprintf(ctx->out, "    RET\n");
+            }
             bslash_stack_reset(ctx);
             if (ctx->opt_level >= 3)
                 bslash_local_invalidate_all(ctx);
@@ -2164,8 +2322,10 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         }
     }
 
-    if (!emitted_return)
+    if (!emitted_return && !fn->is_noreturn)
     {
+        if (ctx->frame_size_bytes > 0)
+            fprintf(ctx->out, "    LEAVE\n");
         fprintf(ctx->out, "    RET\n");
         bslash_stack_reset(ctx);
     }
@@ -2201,7 +2361,6 @@ static bool bslash_emit_module(const CCBackend *backend, const CCModule *module,
     }
 
     BSlashStringTable strings = {0};
-    BSlashDataTable locals = {0};
     size_t string_counter = 0;
     bool success = true;
 
@@ -2231,15 +2390,19 @@ static bool bslash_emit_module(const CCBackend *backend, const CCModule *module,
             success = false;
             goto cleanup;
         }
+        for (size_t fi = 0; fi < module->function_count; ++fi)
+        {
+            const CCFunction *fn = &module->functions[fi];
+            fn_outputs[fi].fn = fn;
+            bool literal_needs_emit = fn && fn->is_literal && !fn->force_inline_literal;
+            fn_outputs[fi].force_emit = fn && (fn->is_preserve || literal_needs_emit);
+        }
     }
 
     for (size_t fi = 0; fi < module->function_count; ++fi)
     {
         const CCFunction *fn = &module->functions[fi];
         BSlashFunctionOutput *out_entry = &fn_outputs[fi];
-        out_entry->fn = fn;
-        bool literal_needs_emit = fn && fn->is_literal && !fn->force_inline_literal;
-        out_entry->force_emit = fn && (fn->is_preserve || literal_needs_emit);
         if (!fn || !fn->name)
             continue;
 
@@ -2261,7 +2424,6 @@ static bool bslash_emit_module(const CCBackend *backend, const CCModule *module,
             .module_output_count = module->function_count,
             .stack_depth = 0,
             .scratch_depth = 0,
-            .locals_table = &locals,
             .local_labels = NULL,
             .local_count = 0,
             .opt_level = opt_level,
@@ -2320,16 +2482,6 @@ static bool bslash_emit_module(const CCBackend *backend, const CCModule *module,
         fwrite(entry->buffer, 1, entry->size, out);
     }
 
-    if (locals.count > 0)
-    {
-        fprintf(out, "// local storage\n\n");
-        for (size_t li = 0; li < locals.count; ++li)
-        {
-            fprintf(out, "%%align 4\n%s:\n", locals.items[li].label);
-            fprintf(out, "    .dword 0\n\n");
-        }
-    }
-
     if (strings.count > 0)
     {
         bool emitted_strings = false;
@@ -2358,7 +2510,6 @@ cleanup:
     if (opened_file && out)
         fclose(out);
     bslash_string_table_destroy(&strings);
-    bslash_data_table_destroy(&locals);
     return success;
 }
 
