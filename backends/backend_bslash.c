@@ -117,6 +117,7 @@ static bool bslash_stack_push_new(BSlashFunctionContext *ctx, size_t line, const
 static bool bslash_stack_push_new_typed(BSlashFunctionContext *ctx, size_t line, CCValueType type, BSlashValue *out_value);
 static bool bslash_stack_push_existing_typed(BSlashFunctionContext *ctx, size_t line, BSlashValue value);
 static bool bslash_stack_pop_value(BSlashFunctionContext *ctx, size_t line, BSlashValue *out_value);
+static void bslash_clear_register_info(BSlashFunctionContext *ctx, const char *reg);
 static bool bslash_record_stack_snapshot(BSlashFunctionContext *ctx, size_t line, const char *label);
 static bool bslash_handle_label_entry(BSlashFunctionContext *ctx, size_t line, const char *label);
 static bool bslash_value_is_wide(CCValueType type);
@@ -148,6 +149,14 @@ static void bslash_forget_live_register_values(BSlashFunctionContext *ctx)
         ctx->reg_info[i].materialized = false;
         ctx->reg_info[i].label = NULL;
     }
+}
+
+static void bslash_forget_call_result_register_values(BSlashFunctionContext *ctx)
+{
+    if (!ctx)
+        return;
+    bslash_clear_register_info(ctx, "B0");
+    bslash_clear_register_info(ctx, "B1");
 }
 
 static bool bslash_emit_simple_param_add(FILE *out, const CCFunction *fn)
@@ -1373,6 +1382,7 @@ static bool bslash_try_emit_o3_string_inline(BSlashFunctionContext *ctx, const C
         {
             fprintf(ctx->out, "    CALL %s\n", printer_symbol);
             bslash_mark_function_needed(ctx, printer_symbol);
+            bslash_forget_call_result_register_values(ctx);
         }
     }
     return true;
@@ -4008,6 +4018,9 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                         if (bslash_get_register_const(ctx, src, &const_value))
                         {
                             bindings[wi].has_const = true;
+
+                    if (strcmp(src, dst) == 0)
+                        continue;
                             bindings[wi].const_value = const_value;
                             continue;
                         }
@@ -4019,8 +4032,6 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                         }
                     }
 
-                    if (strcmp(src, dst) == 0)
-                        continue;
                     moves[move_count++] = (BSlashCallMove){.src = src, .dst = dst};
                 }
 
@@ -4092,6 +4103,7 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
 
                 fprintf(ctx->out, "    CALL %s\n", ins->data.call.symbol);
                 bslash_mark_function_needed(ctx, ins->data.call.symbol);
+                bslash_forget_call_result_register_values(ctx);
                 if (ins->data.call.return_type != CC_TYPE_VOID)
                 {
                     if (bslash_value_is_wide(ins->data.call.return_type))
@@ -4107,39 +4119,14 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     }
                     else
                     {
-                        bool forwarded_return = false;
-                        if (ctx->opt_level >= 2 && (ii + 1) < fn->instruction_count)
+                        const char *dst = NULL;
+                        if (!bslash_stack_push_new(ctx, ins->line, &dst))
                         {
-                            const CCInstruction *next_ins = &fn->instructions[ii + 1];
-                            if (next_ins && next_ins->kind == CC_INSTR_CALL)
-                            {
-                                size_t next_arg_count = next_ins->data.call.arg_count;
-                                if (next_arg_count > 0)
-                                {
-                                    BSlashValue b0_value;
-                                    bslash_value_clear(&b0_value);
-                                    b0_value.type = ins->data.call.return_type;
-                                    b0_value.lo = "B0";
-                                    if (bslash_stack_push_existing_typed(ctx, ins->line, b0_value))
-                                        forwarded_return = true;
-                                }
-                            }
+                            success = false;
+                            goto cleanup;
                         }
-                        if (forwarded_return)
-                        {
-                            // Keep return in B0 for immediate argument use by the next call.
-                        }
-                        else
-                        {
-                            const char *dst = NULL;
-                            if (!bslash_stack_push_new(ctx, ins->line, &dst))
-                            {
-                                success = false;
-                                goto cleanup;
-                            }
-                            if (strcmp(dst, "B0") != 0)
-                                bslash_emit_mov(ctx, dst, "B0");
-                        }
+                        if (strcmp(dst, "B0") != 0)
+                            bslash_emit_mov(ctx, dst, "B0");
                     }
                 }
             }
