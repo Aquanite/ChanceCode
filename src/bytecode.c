@@ -2390,6 +2390,29 @@ static bool cc_function_simplify_const_branches(CCFunction *fn)
     return changed;
 }
 
+static bool cc_function_has_control_flow(const CCFunction *fn)
+{
+    if (!fn)
+        return false;
+    for (size_t i = 0; i < fn->instruction_count; ++i)
+    {
+        const CCInstruction *ins = &fn->instructions[i];
+        if (!ins)
+            continue;
+        switch (ins->kind)
+        {
+        case CC_INSTR_LABEL:
+        case CC_INSTR_JUMP:
+        case CC_INSTR_JUMP_INDIRECT:
+        case CC_INSTR_BRANCH:
+            return true;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
 void cc_module_optimize(CCModule *module, int opt_level)
 {
     if (!module || opt_level <= 0)
@@ -2401,6 +2424,15 @@ void cc_module_optimize(CCModule *module, int opt_level)
         if (!fn || fn->instruction_count == 0)
             continue;
 
+        /*
+         * Current peephole/local-value passes are linear and not CFG-aware.
+         * For branchy functions that merge stack values across labels (e.g.
+         * ternary lowering), these passes can miscompile by deleting path-
+         * specific producers. Keep only conservative pruning until CFG-aware
+         * dataflow is implemented.
+         */
+        bool has_cfg = cc_function_has_control_flow(fn);
+
         bool progress = true;
         while (progress)
         {
@@ -2411,6 +2443,9 @@ void cc_module_optimize(CCModule *module, int opt_level)
             {
                 if (cc_function_strength_reduce_binops(fn))
                     progress = true;
+            }
+            if (opt_level >= 2 && !has_cfg)
+            {
                 if (cc_function_fold_const_binops(fn))
                     progress = true;
                 if (cc_function_fold_const_unops(fn))
@@ -2430,7 +2465,7 @@ void cc_module_optimize(CCModule *module, int opt_level)
                 if (cc_function_prune_dropped_values(fn))
                     progress = true;
             }
-            if (opt_level >= 3)
+            if (opt_level >= 3 && !has_cfg)
             {
                 if (cc_function_promote_local_values(fn))
                     progress = true;
