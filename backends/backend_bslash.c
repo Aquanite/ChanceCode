@@ -413,7 +413,51 @@ static void bslash_emit_global_int(FILE *out, uint64_t value, size_t size_bytes)
         fprintf(out, "    .qword 0x%016" PRIx64 "\n", value);
 }
 
-static void bslash_emit_global_definition(FILE *out, const CCGlobal *global)
+static bool bslash_symbol_needs_module_mangle(const char *symbol)
+{
+    return symbol && strncmp(symbol, "__ccb_str_", 10) == 0;
+}
+
+static uint32_t bslash_module_symbol_tag(const CCModule *module)
+{
+    const char *seed = NULL;
+    if (module && module->debug_files && module->debug_file_count > 0)
+        seed = module->debug_files[0];
+    if (!seed)
+        seed = "unknown-module";
+
+    uint32_t hash = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)seed; *p; ++p)
+    {
+        hash ^= (uint32_t)(*p);
+        hash *= 16777619u;
+    }
+    if (module)
+    {
+        hash ^= (uint32_t)module->function_count;
+        hash *= 16777619u;
+        hash ^= (uint32_t)module->global_count;
+        hash *= 16777619u;
+    }
+    return hash ? hash : 1u;
+}
+
+static const char *bslash_resolve_symbol_name(const CCModule *module, const char *symbol, char *buffer, size_t buffer_size)
+{
+    if (!symbol)
+        return symbol;
+    if (!bslash_symbol_needs_module_mangle(symbol))
+        return symbol;
+    if (!buffer || buffer_size == 0)
+        return symbol;
+
+    const char *suffix = symbol + 6; // skip "__ccb_"
+    uint32_t tag = bslash_module_symbol_tag(module);
+    snprintf(buffer, buffer_size, "__ccb_%08" PRIx32 "_%s", tag, suffix);
+    return buffer;
+}
+
+static void bslash_emit_global_definition(FILE *out, const CCModule *module, const CCGlobal *global)
 {
     if (!out || !global || !global->name || global->is_extern)
         return;
@@ -427,8 +471,11 @@ static void bslash_emit_global_definition(FILE *out, const CCGlobal *global)
     if (storage_size == 0)
         storage_size = 1;
 
+    char resolved_name[256];
+    const char *global_name = bslash_resolve_symbol_name(module, global->name, resolved_name, sizeof(resolved_name));
+
     fprintf(out, "%%align %zu\n", align_bytes);
-    fprintf(out, "%s:\n", global->name);
+    fprintf(out, "%s:\n", global_name);
 
     size_t initialized_bytes = 0;
     switch (global->init.kind)
@@ -546,10 +593,12 @@ static void bslash_emit_global_definition(FILE *out, const CCGlobal *global)
             }
             else
             {
+                char resolved_entry[256];
+                const char *entry_name = bslash_resolve_symbol_name(module, entry, resolved_entry, sizeof(resolved_entry));
                 if (elem_size == 8)
-                    fprintf(out, "    .qword %s\n", entry);
+                    fprintf(out, "    .qword %s\n", entry_name);
                 else
-                    fprintf(out, "    .dword %s\n", entry);
+                    fprintf(out, "    .dword %s\n", entry_name);
             }
         }
         initialized_bytes = count * elem_size;
@@ -576,7 +625,7 @@ static void bslash_emit_globals(FILE *out, const CCModule *module)
         return;
     fprintf(out, "// globals\n\n");
     for (size_t i = 0; i < module->global_count; ++i)
-        bslash_emit_global_definition(out, &module->globals[i]);
+        bslash_emit_global_definition(out, module, &module->globals[i]);
 }
 
 static void emit_diag(CCDiagnosticSink *sink, CCDiagnosticSeverity severity, size_t line, const char *fmt, ...)
@@ -744,7 +793,10 @@ static void bslash_emit_movi32_label(BSlashFunctionContext *ctx, const char *dst
 {
     if (!ctx || !dst || !label)
         return;
-    fprintf(ctx->out, "    MOVI32 %s, #%s\n", dst, label);
+
+    char resolved_label[256];
+    const char *label_name = bslash_resolve_symbol_name(ctx->module, label, resolved_label, sizeof(resolved_label));
+    fprintf(ctx->out, "    MOVI32 %s, #%s\n", dst, label_name);
     bslash_mark_string_needed(ctx->strings, label);
     bslash_set_register_label(ctx, dst, label, true);
 }
@@ -2399,7 +2451,13 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
     ctx->local_known_labels = NULL;
     ctx->local_materialized = NULL;
     ctx->local_storage_registered = NULL;
-    ctx->enable_local_value_folding = (ctx->opt_level >= 3);
+    /*
+     * Local value folding is currently too aggressive for some pointer-heavy
+     * MMIO store chains (e.g. GDP register writes) and can rewrite stores to
+     * stale addresses under O3. Keep it disabled until aliasing/dataflow is
+     * made path-accurate.
+     */
+    ctx->enable_local_value_folding = false;
 
     if (ctx->enable_local_value_folding)
     {
@@ -3107,8 +3165,6 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 success = false;
                 goto cleanup;
             }
-            fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", cond);
-            fprintf(ctx->out, "    BNZ %s\n", scoped_true_target);
             bool false_target_is_fallthrough = false;
             if ((ii + 1) < fn->instruction_count)
             {
@@ -3117,6 +3173,14 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     strcmp(next_ins->data.label.name, ins->data.branch.false_target) == 0)
                     false_target_is_fallthrough = true;
             }
+
+            char branch_false_local[128];
+            bslash_make_temp_label(ctx, branch_false_local, sizeof(branch_false_local), "branch_false");
+
+            fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", cond);
+            fprintf(ctx->out, "    BZ %s\n", branch_false_local);
+            fprintf(ctx->out, "    J32 %s\n", scoped_true_target);
+            fprintf(ctx->out, "%s:\n", branch_false_local);
             if (!false_target_is_fallthrough)
                 fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
             bslash_release_register(ctx, cond);
@@ -3145,6 +3209,15 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 switch (ins->data.binop.op)
                 {
                 case CC_BINOP_ADD:
+                    fprintf(ctx->out, "    ADD.F %s, %s\n", lhs_value.lo, rhs_value.lo);
+                    fprintf(ctx->out, "    ADC.F %s, %s\n", lhs_value.hi, rhs_value.hi);
+                    break;
+                case CC_BINOP_SUB:
+                    /* lhs - rhs == lhs + (~rhs + 1) */
+                    fprintf(ctx->out, "    NOT %s, %s\n", rhs_value.lo, rhs_value.lo);
+                    fprintf(ctx->out, "    NOT %s, %s\n", rhs_value.hi, rhs_value.hi);
+                    fprintf(ctx->out, "    ADDI8.F %s, #0x01\n", rhs_value.lo);
+                    fprintf(ctx->out, "    ADCI8.F %s, #0x00\n", rhs_value.hi);
                     fprintf(ctx->out, "    ADD.F %s, %s\n", lhs_value.lo, rhs_value.lo);
                     fprintf(ctx->out, "    ADC.F %s, %s\n", lhs_value.hi, rhs_value.hi);
                     break;
