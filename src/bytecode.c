@@ -2423,14 +2423,6 @@ void cc_module_optimize(CCModule *module, int opt_level)
         CCFunction *fn = &module->functions[i];
         if (!fn || fn->instruction_count == 0)
             continue;
-
-        /*
-         * Current peephole/local-value passes are linear and not CFG-aware.
-         * For branchy functions that merge stack values across labels (e.g.
-         * ternary lowering), these passes can miscompile by deleting path-
-         * specific producers. Keep only conservative pruning until CFG-aware
-         * dataflow is implemented.
-         */
         bool has_cfg = cc_function_has_control_flow(fn);
 
         bool progress = true;

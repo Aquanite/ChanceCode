@@ -1954,7 +1954,7 @@ static bool parse_loc_directive(LoaderState *st, char *line)
 
 static bool parse_global(LoaderState *st, char *line)
 {
-    char *cursor = line + 7; /* skip ".global" */
+    char *cursor = line + 7;
     while (*cursor && isspace((unsigned char)*cursor))
         ++cursor;
 
@@ -2306,7 +2306,7 @@ static bool parse_global(LoaderState *st, char *line)
 
 static bool parse_extern(LoaderState *st, char *line)
 {
-    char *cursor = line + 7; /* skip ".extern" */
+    char *cursor = line + 7;
     while (*cursor && isspace((unsigned char)*cursor))
         ++cursor;
 
@@ -3222,7 +3222,6 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         return false;
     }
 
-    // Read the entire file into memory
     if (fseek(file, 0, SEEK_END) != 0)
     {
         if (sink)
@@ -3251,10 +3250,8 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
     file_buf[read_bytes] = '\0';
     fclose(file);
 
-    // Check for CCBIN magic
     if (read_bytes >= 5 && memcmp(file_buf, "CCBIN", 5) == 0)
     {
-        // Reopen as binary for cc_load_binary
         FILE *binfile = fopen(path, "rb");
         if (!binfile)
         {
@@ -3269,7 +3266,6 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         return ok;
     }
 
-    // Parse as text from buffer
     bool success = true;
     LoaderState st = {0};
     st.path = path;
@@ -3280,7 +3276,6 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
 
     cc_module_init(module, 0);
 
-    // Split file_buf into lines (handle arbitrarily long lines)
     char *buf_ptr = file_buf;
     bool header_read = false;
     CCFunction *current_fn = NULL;
@@ -3300,7 +3295,6 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             buf_ptr += strlen(buf_ptr);
         }
         ++st.line;
-        // Remove trailing carriage return if present
         size_t linelen = strlen(line_start);
         if (linelen > 0 && line_start[linelen - 1] == '\r')
             line_start[linelen - 1] = '\0';
@@ -3671,7 +3665,6 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             if (!success)
                 break;
 
-            // Validate that varargs functions have at least one explicit parameter
             if (current_fn->is_varargs && current_fn->param_count == 0)
             {
                 loader_diag(&st, CC_DIAG_ERROR, st.line,
