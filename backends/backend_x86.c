@@ -3338,6 +3338,7 @@ static bool emit_module(const CCBackend *backend,
     ctx.sink = sink;
     ctx.syntax = backend && backend->userdata ? (const X86Syntax *)backend->userdata : &kNasmSyntax;
     const char *debug_opt = backend_option_get(options, "debug");
+    const char *function_filter = backend_option_get(options, "function");
     ctx.keep_debug_names = option_is_enabled(debug_opt);
     const char *target_os_opt = backend_option_get(options, "target-os");
     if (target_os_opt)
@@ -3389,6 +3390,11 @@ static bool emit_module(const CCBackend *backend,
 
     for (size_t i = 0; i < module->function_count; ++i)
     {
+        if (function_filter && *function_filter &&
+            (!module->functions[i].name || strcmp(module->functions[i].name, function_filter) != 0))
+        {
+            continue;
+        }
         if (!emit_function(&ctx, &module->functions[i]))
         {
             if (out != stdout)

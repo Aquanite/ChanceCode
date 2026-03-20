@@ -4037,6 +4037,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	const char *debug_opt = backend_option_get(options, "debug");
 	const char *strip_opt = backend_option_get(options, "strip");
 	const char *obfuscate_opt = backend_option_get(options, "obfuscate");
+	const char *function_filter = backend_option_get(options, "function");
 
 	if (config && config->target_os_option)
 	{
@@ -4128,6 +4129,11 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 
 	for (size_t i = 0; i < module->function_count; ++i)
 	{
+		if (function_filter && *function_filter &&
+			(!module->functions[i].name || strcmp(module->functions[i].name, function_filter) != 0))
+		{
+			continue;
+		}
 		Arm64FunctionContext fn_ctx;
 		memset(&fn_ctx, 0, sizeof(fn_ctx));
 		fn_ctx.module = &ctx;
