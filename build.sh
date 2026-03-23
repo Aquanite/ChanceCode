@@ -13,5 +13,9 @@ GENERATOR="Unix Makefiles"
 if command -v ninja >/dev/null 2>&1; then
   GENERATOR="Ninja"
 fi
-cmake -S . -B build -G "$GENERATOR" -DCMAKE_BUILD_TYPE=Release
+if [[ ! -f build/CMakeCache.txt ]]; then
+  cmake -S . -B build -G "$GENERATOR" -DCMAKE_BUILD_TYPE=Release
+else
+  echo "Using existing CMake cache in ./build (skipping configure)"
+fi
 cmake --build build --config Release
