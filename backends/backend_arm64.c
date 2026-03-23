@@ -1247,16 +1247,8 @@ static void arm64_emit_symbol_address(const Arm64ModuleContext *ctx, FILE *out, 
 		return;
 	char symbol_buf[256];
 	const char *label = arm64_format_symbol(ctx, symbol, symbol_buf, sizeof(symbol_buf));
-	if (ctx->config && ctx->config->format == ARM64_OBJECT_MACHO)
-	{
-		fprintf(out, "    adrp %s, %s@PAGE\n", dst_reg, label);
-		fprintf(out, "    add %s, %s, %s@PAGEOFF\n", dst_reg, dst_reg, label);
-	}
-	else
-	{
-		fprintf(out, "    adrp %s, %s\n", dst_reg, label);
-		fprintf(out, "    add %s, %s, :lo12:%s\n", dst_reg, dst_reg, label);
-	}
+	fprintf(out, "    adrp %s, %s@PAGE\n", dst_reg, label);
+	fprintf(out, "    add %s, %s, %s@PAGEOFF\n", dst_reg, dst_reg, label);
 }
 
 static const char *arm64_local_label_name(Arm64FunctionContext *ctx, const char *suffix, char *buffer, size_t buffer_size)
@@ -3018,14 +3010,17 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	}
 	Arm64Value target_value;
 	bool have_target_value = false;
+	size_t arg_base = 0;
 	if (is_indirect)
 	{
-		if (!function_stack_pop(ctx, &target_value))
-		{
-			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "call '<indirect>' missing function pointer");
-			return false;
-		}
+		size_t target_index = ctx->stack_size - 1;
+		target_value = ctx->stack[target_index];
+		arg_base = ctx->stack_size - arg_count - 1;
 		have_target_value = true;
+	}
+	else
+	{
+		arg_base = ctx->stack_size - arg_count;
 	}
 	size_t gp_used = 0;
 	size_t fp_used = 0;
@@ -3037,7 +3032,6 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	size_t vararg_pack_base = 0;
 	size_t vararg_count = 0;
 	size_t total_stack_adjust = 0;
-	size_t arg_base = ctx->stack_size - arg_count;
 	for (size_t i = 0; i < arg_base; ++i)
 	{
 		if (!arm64_force_stack_slot(ctx, &ctx->stack[i], i))
@@ -3078,7 +3072,7 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 
 	for (size_t i = 0; i < arg_count; ++i)
 	{
-		Arm64Value *value = &ctx->stack[ctx->stack_size - arg_count + i];
+		Arm64Value *value = &ctx->stack[arg_base + i];
 		CCValueType arg_type = ins->data.call.arg_types ? ins->data.call.arg_types[i] : CC_TYPE_I64;
 		bool is_float = (arg_type == CC_TYPE_F32) || (arg_type == CC_TYPE_F64);
 		bool is_vararg_arg = call_declares_varargs && (i >= fixed_params);
@@ -3339,7 +3333,7 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	if (total_stack_adjust > 0)
 		arm64_adjust_sp(ctx, total_stack_adjust, false);
 
-	ctx->stack_size -= arg_count;
+	ctx->stack_size -= arg_count + (is_indirect ? 1 : 0);
 
 	if (ins->data.call.return_type != CC_TYPE_VOID)
 	{

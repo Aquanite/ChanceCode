@@ -88,10 +88,35 @@ static const X86Syntax kGasSyntax = {
     .flavor = X86_ASM_GAS,
     .backend_name = "x86-gas",
     .backend_description = "GNU assembler x86-64 backend (.intel_syntax)",
-    .comment_prefix = "#",
+    .comment_prefix = "//",
     .text_section = ".text",
     .data_section = ".data",
     .rodata_section = ".section .rodata",
+    .bss_section = ".bss",
+    .global_directive = ".globl",
+    .extern_directive = ".extern",
+    .align_directive = ".balign",
+    .byte_directive = ".byte",
+    .word_directive = ".word",
+    .dword_directive = ".long",
+    .qword_directive = ".quad",
+    .space_directive = ".space",
+    .byte_mem_keyword = "byte ptr",
+    .word_mem_keyword = "word ptr",
+    .dword_mem_keyword = "dword ptr",
+    .qword_mem_keyword = "qword ptr",
+    .rip_relative_operand_fmt = "[rip + %s]",
+    .needs_intel_syntax = true,
+};
+
+static const X86Syntax kGasMacOSSyntax = {
+    .flavor = X86_ASM_GAS,
+    .backend_name = "x86-gas",
+    .backend_description = "GNU assembler x86-64 backend (.intel_syntax)",
+    .comment_prefix = "//",
+    .text_section = ".text",
+    .data_section = ".data",
+    .rodata_section = ".section __TEXT,__const",
     .bss_section = ".bss",
     .global_directive = ".globl",
     .extern_directive = ".extern",
@@ -464,6 +489,29 @@ static bool module_symbol_is_varargs(const CCModule *module, const char *name)
     }
 
     return false;
+}
+
+static bool module_symbol_exists(const CCModule *module, const char *name)
+{
+    if (!module || !name || !*name)
+        return false;
+    if (cc_module_find_extern_const(module, name))
+        return true;
+    return module_has_function(module, name);
+}
+
+static bool symbol_has_varargs_suffix(const char *name)
+{
+    static const char suffix[] = "_varargs";
+    size_t nlen;
+    size_t slen;
+    if (!name)
+        return false;
+    nlen = strlen(name);
+    slen = sizeof(suffix) - 1;
+    if (nlen < slen)
+        return false;
+    return strcmp(name + (nlen - slen), suffix) == 0;
 }
 
 static const CCGlobal *module_find_global(const CCModule *module, const char *name)
@@ -2416,6 +2464,8 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     bool is_indirect = (ins->kind == CC_INSTR_CALL_INDIRECT) || (ins->data.call.symbol == NULL);
     bool pointer_in_r11 = false;
+    char resolved_symbol_buf[1024];
+    const char *call_symbol = ins->data.call.symbol;
 #define CALL_FAIL_RETURN()               \
     do                                   \
     {                                    \
@@ -2449,9 +2499,23 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     if (arg_count > 0)
         args = ctx->stack + (ctx->stack_size - arg_count);
 
+    if (!is_indirect && call_symbol && !symbol_has_varargs_suffix(call_symbol))
+    {
+        int written = snprintf(resolved_symbol_buf, sizeof(resolved_symbol_buf), "%s_varargs", call_symbol);
+        if (written > 0 && (size_t)written < sizeof(resolved_symbol_buf) &&
+            module_symbol_exists(ctx->module->module, resolved_symbol_buf))
+        {
+            bool declared_varargs = ins->data.call.is_varargs ||
+                                    module_symbol_is_varargs(ctx->module->module, call_symbol) ||
+                                    module_symbol_is_varargs(ctx->module->module, resolved_symbol_buf);
+            if (declared_varargs || !module_symbol_exists(ctx->module->module, call_symbol))
+                call_symbol = resolved_symbol_buf;
+        }
+    }
+
     bool is_varargs = ins->data.call.is_varargs;
-    if (!is_indirect && ins->data.call.symbol)
-        is_varargs = module_symbol_is_varargs(ctx->module->module, ins->data.call.symbol);
+    if (!is_indirect && call_symbol)
+        is_varargs = module_symbol_is_varargs(ctx->module->module, call_symbol);
 
     typedef enum
     {
@@ -2549,8 +2613,8 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     size_t align_padding = remainder ? (X86_STACK_ALIGNMENT - remainder) : 0;
     size_t call_frame_size = base_call_area + align_padding;
     bool is_noreturn = false;
-    if (!is_indirect && ins->data.call.symbol)
-        is_noreturn = module_symbol_is_noreturn(ctx->module->module, ins->data.call.symbol);
+    if (!is_indirect && call_symbol)
+        is_noreturn = module_symbol_is_noreturn(ctx->module->module, call_symbol);
 
     if (call_frame_size > 0)
         fprintf(ctx->out, "    sub rsp, %zu\n", call_frame_size);
@@ -2652,8 +2716,8 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     }
     else
     {
-        const char *target = module_symbol_alias(ctx->module, ins->data.call.symbol);
-        fprintf(ctx->out, "    call %s\n", target ? target : ins->data.call.symbol);
+        const char *target = module_symbol_alias(ctx->module, call_symbol);
+        fprintf(ctx->out, "    call %s\n", target ? target : call_symbol);
     }
 
     if (ctx->stack_size >= arg_count)
@@ -3345,16 +3409,19 @@ static bool emit_module(const CCBackend *backend,
     {
         if (equals_ignore_case(target_os_opt, "windows"))
             ctx.abi = &kX86AbiWin64;
-        else if (equals_ignore_case(target_os_opt, "linux"))
+        else if (equals_ignore_case(target_os_opt, "linux") || equals_ignore_case(target_os_opt, "macos"))
             ctx.abi = &kX86AbiSystemV;
         else
         {
-            emit_diag(sink, CC_DIAG_ERROR, 0, "unknown target-os '%s' (expected windows or linux)", target_os_opt);
+            emit_diag(sink, CC_DIAG_ERROR, 0, "unknown target-os '%s' (expected windows, linux, or macos)", target_os_opt);
             if (out != stdout)
                 fclose(out);
             hidden_function_aliases_destroy(&ctx);
             return false;
         }
+
+        if (equals_ignore_case(target_os_opt, "macos") && ctx.syntax == &kGasSyntax)
+            ctx.syntax = &kGasMacOSSyntax;
     }
     else
     {

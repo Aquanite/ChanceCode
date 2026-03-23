@@ -7,6 +7,15 @@
   },
   "configurePresets": [
     {
+      "name": "ninja-release",
+      "displayName": "Ninja - Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "mingw-release",
       "displayName": "MinGW Makefiles - Release",
       "generator": "MinGW Makefiles",
@@ -31,6 +40,10 @@
   ],
   "buildPresets": [
     {
+      "name": "ninja-release",
+      "configurePreset": "ninja-release"
+    },
+    {
       "name": "mingw-release",
       "configurePreset": "mingw-release"
     },
@@ -41,6 +54,11 @@
     }
   ],
   "testPresets": [
+    {
+      "name": "ninja-release",
+      "configurePreset": "ninja-release",
+      "output": { "outputOnFailure": true }
+    },
     {
       "name": "mingw-release",
       "configurePreset": "mingw-release",
