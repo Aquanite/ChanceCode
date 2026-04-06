@@ -1,25 +1,64 @@
 @echo off
 setlocal ENABLEEXTENSIONS
 
-REM Usage: build.bat [preset]
-REM If a CMake preset is provided (default: mingw-release), use it.
-REM Otherwise, fall back to a local MinGW Makefiles configure+build in ./build.
+REM =========================
+REM Usage:
+REM   build.bat [preset] [config] [generator]
+REM =========================
 
 set "PRESET=%~1"
-if "%PRESET%"=="" set "PRESET=mingw-release"
+set "CONFIG=%~2"
+set "GENERATOR=%~3"
 
-echo [Windows] Building with CMake preset "%PRESET%"...
-cmake --build --preset "%PRESET%"
-if errorlevel 1 goto FALLBACK
+if "%CONFIG%"=="" set "CONFIG=Release"
 
-goto :EOF
+REM -------------------------
+REM Try preset if provided
+REM -------------------------
+if not "%PRESET%"=="" (
+    echo [Windows] Building with CMake preset "%PRESET%"...
+    cmake --build --preset "%PRESET%"
+    if not errorlevel 1 exit /b %ERRORLEVEL%
+    echo [Windows] Preset failed, falling back...
+)
 
-:FALLBACK
-echo [Windows] Preset build failed. Falling back to MinGW Makefiles in .\build ...
+REM -------------------------
+REM Auto-detect generator if not provided
+REM -------------------------
+if "%GENERATOR%"=="" (
+    where ninja >nul 2>nul
+    if not errorlevel 1 (
+        set "GENERATOR=Ninja"
+    ) else (
+        where cl >nul 2>nul
+        if not errorlevel 1 (
+            set "GENERATOR=Visual Studio 17 2022"
+        ) else (
+            where gcc >nul 2>nul
+            if not errorlevel 1 (
+                set "GENERATOR=MinGW Makefiles"
+            ) else (
+                echo [Windows] No suitable compiler found.
+                goto ERROR
+            )
+        )
+    )
+)
+
+echo [Windows] Using generator: %GENERATOR%
+
+REM -------------------------
+REM Configure
+REM -------------------------
 if not exist build mkdir build
-cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+cmake -S . -B build -G "%GENERATOR%" -DCMAKE_BUILD_TYPE=%CONFIG%
 if errorlevel 1 goto ERROR
-cmake --build build --config Release
+
+REM -------------------------
+REM Build
+REM -------------------------
+cmake --build build --config %CONFIG%
 if errorlevel 1 goto ERROR
 
 exit /b %ERRORLEVEL%
