@@ -1059,6 +1059,66 @@ static void bslash_make_temp_label(BSlashFunctionContext *ctx, char *buffer, siz
     snprintf(buffer, buffer_size, "%s__%s_%zu", bslash_function_name(ctx), kind ? kind : "tmp", ctx->temp_label_counter++);
 }
 
+static bool bslash_emit_widen_f32_bits_to_f64(BSlashFunctionContext *ctx, size_t line, const char *lo_reg, const char *hi_reg)
+{
+    if (!ctx || !lo_reg || !hi_reg)
+        return false;
+
+    const char *tmp0 = bslash_scratch_acquire(ctx, line);
+    const char *tmp1 = bslash_scratch_acquire(ctx, line);
+    if (!tmp0 || !tmp1)
+    {
+        if (tmp1)
+            bslash_scratch_release(ctx);
+        if (tmp0)
+            bslash_scratch_release(ctx);
+        return false;
+    }
+
+    char zero_label[128];
+    char done_label[128];
+    bslash_make_temp_label(ctx, zero_label, sizeof(zero_label), "widen_f32_to_f64_zero");
+    bslash_make_temp_label(ctx, done_label, sizeof(done_label), "widen_f32_to_f64_done");
+
+    fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", lo_reg);
+    fprintf(ctx->out, "    BZ %s\n", zero_label);
+
+    /* sign -> bit63 */
+    bslash_emit_mov(ctx, hi_reg, lo_reg);
+    fprintf(ctx->out, "    ANDI32 %s, #0x80000000\n", hi_reg);
+
+    /* exp64 = (exp32 + (1023-127)) << 20 */
+    bslash_emit_mov(ctx, tmp0, lo_reg);
+    fprintf(ctx->out, "    LSRI8 %s, #0x17\n", tmp0);
+    fprintf(ctx->out, "    ANDI32 %s, #0x000000FF\n", tmp0);
+    bslash_emit_addi(ctx, tmp0, 896);
+    fprintf(ctx->out, "    SHLI8 %s, #0x14\n", tmp0);
+    fprintf(ctx->out, "    OR %s, %s\n", hi_reg, tmp0);
+
+    /* mantissa: hi20 = frac>>3, lo32 = (frac&7)<<29 */
+    bslash_emit_mov(ctx, tmp1, lo_reg);
+    fprintf(ctx->out, "    ANDI32 %s, #0x007FFFFF\n", tmp1);
+    bslash_emit_mov(ctx, tmp0, tmp1);
+    fprintf(ctx->out, "    LSRI8 %s, #0x03\n", tmp0);
+    fprintf(ctx->out, "    OR %s, %s\n", hi_reg, tmp0);
+    fprintf(ctx->out, "    ANDI32 %s, #0x00000007\n", tmp1);
+    fprintf(ctx->out, "    SHLI8 %s, #0x1D\n", tmp1);
+    bslash_emit_mov(ctx, lo_reg, tmp1);
+    fprintf(ctx->out, "    J32 %s\n", done_label);
+
+    fprintf(ctx->out, "%s:\n", zero_label);
+    bslash_emit_movi32_u32(ctx, lo_reg, 0);
+    bslash_emit_movi32_u32(ctx, hi_reg, 0);
+    fprintf(ctx->out, "%s:\n", done_label);
+
+    bslash_clear_register_info(ctx, lo_reg);
+    bslash_clear_register_info(ctx, hi_reg);
+
+    bslash_scratch_release(ctx);
+    bslash_scratch_release(ctx);
+    return true;
+}
+
 static const char *bslash_compare_branch_opcode(CCCompareOp op, bool is_unsigned)
 {
     switch (op)
@@ -2726,15 +2786,50 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             if (bslash_value_is_wide(local_type))
             {
                 const char *addr_reg = NULL;
+                const char *hi_reg = stored_value.hi;
+                bool hi_is_scratch = false;
                 if (!bslash_require_local_storage(ctx, local_index))
                 {
                     bslash_release_value(ctx, stored_value);
                     success = false;
                     goto cleanup;
                 }
+                if (!hi_reg)
+                {
+                    hi_reg = bslash_scratch_acquire(ctx, ins->line);
+                    if (!hi_reg)
+                    {
+                        bslash_release_value(ctx, stored_value);
+                        success = false;
+                        goto cleanup;
+                    }
+                    hi_is_scratch = true;
+                    if (local_type == CC_TYPE_F64)
+                    {
+                        if (!bslash_emit_widen_f32_bits_to_f64(ctx, ins->line, stored_value.lo, hi_reg))
+                        {
+                            bslash_scratch_release(ctx);
+                            bslash_release_value(ctx, stored_value);
+                            success = false;
+                            goto cleanup;
+                        }
+                    }
+                    else if (local_type == CC_TYPE_I64)
+                    {
+                        bslash_emit_mov(ctx, hi_reg, stored_value.lo);
+                        fprintf(ctx->out, "    ASRI8 %s, #0x1F\n", hi_reg);
+                        bslash_clear_register_info(ctx, hi_reg);
+                    }
+                    else
+                    {
+                        bslash_emit_movi32_u32(ctx, hi_reg, 0);
+                    }
+                }
                 addr_reg = bslash_scratch_acquire(ctx, ins->line);
                 if (!addr_reg)
                 {
+                    if (hi_is_scratch)
+                        bslash_scratch_release(ctx);
                     bslash_release_value(ctx, stored_value);
                     success = false;
                     goto cleanup;
@@ -2745,8 +2840,10 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 bslash_ensure_value_materialized(ctx, stored_value);
                 fprintf(ctx->out, "    ST [%s], %s\n", addr_reg, stored_value.lo);
                 bslash_emit_addi(ctx, addr_reg, 4);
-                fprintf(ctx->out, "    ST [%s], %s\n", addr_reg, stored_value.hi);
+                fprintf(ctx->out, "    ST [%s], %s\n", addr_reg, hi_reg);
                 bslash_scratch_release(ctx);
+                if (hi_is_scratch)
+                    bslash_scratch_release(ctx);
                 bslash_release_value(ctx, stored_value);
                 if (ctx->local_known_values)
                     ctx->local_known_values[local_index] = false;
@@ -3060,8 +3157,45 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             fprintf(ctx->out, "    %s [%s], %s\n", store_op, addr, stored_value.lo);
             if (bslash_value_is_wide(stored_value.type))
             {
+                const char *hi_reg = stored_value.hi;
+                bool hi_is_scratch = false;
+                if (!hi_reg)
+                {
+                    hi_reg = bslash_scratch_acquire(ctx, ins->line);
+                    if (!hi_reg)
+                    {
+                        bslash_scratch_release(ctx);
+                        bslash_release_value(ctx, stored_value);
+                        success = false;
+                        goto cleanup;
+                    }
+                    hi_is_scratch = true;
+                    if (ins->data.global.type == CC_TYPE_F64)
+                    {
+                        if (!bslash_emit_widen_f32_bits_to_f64(ctx, ins->line, stored_value.lo, hi_reg))
+                        {
+                            bslash_scratch_release(ctx);
+                            bslash_scratch_release(ctx);
+                            bslash_release_value(ctx, stored_value);
+                            success = false;
+                            goto cleanup;
+                        }
+                    }
+                    else if (ins->data.global.type == CC_TYPE_I64)
+                    {
+                        bslash_emit_mov(ctx, hi_reg, stored_value.lo);
+                        fprintf(ctx->out, "    ASRI8 %s, #0x1F\n", hi_reg);
+                        bslash_clear_register_info(ctx, hi_reg);
+                    }
+                    else
+                    {
+                        bslash_emit_movi32_u32(ctx, hi_reg, 0);
+                    }
+                }
                 bslash_emit_addi(ctx, addr, 4);
-                fprintf(ctx->out, "    ST [%s], %s\n", addr, stored_value.hi);
+                fprintf(ctx->out, "    ST [%s], %s\n", addr, hi_reg);
+                if (hi_is_scratch)
+                    bslash_scratch_release(ctx);
             }
             bslash_scratch_release(ctx);
             bslash_release_value(ctx, stored_value);
@@ -3307,6 +3441,247 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     bslash_scratch_release(ctx); /* tmp */
                     bslash_scratch_release(ctx); /* mul_hi */
                     bslash_scratch_release(ctx); /* mul_lo */
+                    break;
+                }
+                case CC_BINOP_DIV:
+                case CC_BINOP_MOD:
+                {
+                    bool is_unsigned_wide = ins->data.binop.is_unsigned || !cc_value_type_is_signed(ins->data.binop.type);
+                    const char *quot_lo = bslash_scratch_acquire(ctx, ins->line);
+                    const char *quot_hi = bslash_scratch_acquire(ctx, ins->line);
+                    const char *rem_lo = bslash_scratch_acquire(ctx, ins->line);
+                    const char *rem_hi = bslash_scratch_acquire(ctx, ins->line);
+                    const char *count_reg = bslash_scratch_acquire(ctx, ins->line);
+                    const char *tmp_a = bslash_scratch_acquire(ctx, ins->line);
+                    const char *tmp_b = bslash_scratch_acquire(ctx, ins->line);
+                    const char *sign_q = NULL;
+                    const char *sign_r = NULL;
+                    if (!quot_lo || !quot_hi || !rem_lo || !rem_hi || !count_reg || !tmp_a || !tmp_b)
+                    {
+                        if (tmp_b)
+                            bslash_scratch_release(ctx);
+                        if (tmp_a)
+                            bslash_scratch_release(ctx);
+                        if (count_reg)
+                            bslash_scratch_release(ctx);
+                        if (rem_hi)
+                            bslash_scratch_release(ctx);
+                        if (rem_lo)
+                            bslash_scratch_release(ctx);
+                        if (quot_hi)
+                            bslash_scratch_release(ctx);
+                        if (quot_lo)
+                            bslash_scratch_release(ctx);
+                        success = false;
+                        bslash_release_value(ctx, rhs_value);
+                        bslash_release_value(ctx, lhs_value);
+                        goto cleanup;
+                    }
+
+                    if (!is_unsigned_wide)
+                    {
+                        sign_q = bslash_scratch_acquire(ctx, ins->line);
+                        sign_r = bslash_scratch_acquire(ctx, ins->line);
+                        if (!sign_q || !sign_r)
+                        {
+                            if (sign_r)
+                                bslash_scratch_release(ctx);
+                            if (sign_q)
+                                bslash_scratch_release(ctx);
+                            bslash_scratch_release(ctx); /* tmp_b */
+                            bslash_scratch_release(ctx); /* tmp_a */
+                            bslash_scratch_release(ctx); /* count_reg */
+                            bslash_scratch_release(ctx); /* rem_hi */
+                            bslash_scratch_release(ctx); /* rem_lo */
+                            bslash_scratch_release(ctx); /* quot_hi */
+                            bslash_scratch_release(ctx); /* quot_lo */
+                            success = false;
+                            bslash_release_value(ctx, rhs_value);
+                            bslash_release_value(ctx, lhs_value);
+                            goto cleanup;
+                        }
+                    }
+
+                    char loop_label[128];
+                    char done_label[128];
+                    char do_sub_label[128];
+                    char skip_sub_label[128];
+                    bslash_make_temp_label(ctx, loop_label, sizeof(loop_label), "wide_div_loop");
+                    bslash_make_temp_label(ctx, done_label, sizeof(done_label), "wide_div_done");
+                    bslash_make_temp_label(ctx, do_sub_label, sizeof(do_sub_label), "wide_div_do_sub");
+                    bslash_make_temp_label(ctx, skip_sub_label, sizeof(skip_sub_label), "wide_div_skip_sub");
+
+                    bslash_emit_movi32_u32(ctx, quot_lo, 0);
+                    bslash_emit_movi32_u32(ctx, quot_hi, 0);
+                    bslash_emit_movi32_u32(ctx, rem_lo, 0);
+                    bslash_emit_movi32_u32(ctx, rem_hi, 0);
+
+                    if (!is_unsigned_wide)
+                    {
+                        char lhs_nonneg_label[128];
+                        char rhs_nonneg_label[128];
+                        char q_sign_done_label[128];
+                        char r_sign_done_label[128];
+                        bslash_make_temp_label(ctx, lhs_nonneg_label, sizeof(lhs_nonneg_label), "wide_div_lhs_nonneg");
+                        bslash_make_temp_label(ctx, rhs_nonneg_label, sizeof(rhs_nonneg_label), "wide_div_rhs_nonneg");
+                        bslash_make_temp_label(ctx, q_sign_done_label, sizeof(q_sign_done_label), "wide_div_q_sign_done");
+                        bslash_make_temp_label(ctx, r_sign_done_label, sizeof(r_sign_done_label), "wide_div_r_sign_done");
+
+                        bslash_emit_movi32_u32(ctx, sign_q, 0);
+                        bslash_emit_movi32_u32(ctx, sign_r, 0);
+
+                        fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", lhs_value.hi);
+                        fprintf(ctx->out, "    BGE %s\n", lhs_nonneg_label);
+                        bslash_emit_movi32_u32(ctx, sign_r, 1);
+                        bslash_emit_movi32_u32(ctx, sign_q, 1);
+                        fprintf(ctx->out, "    NOT %s, %s\n", lhs_value.lo, lhs_value.lo);
+                        fprintf(ctx->out, "    NOT %s, %s\n", lhs_value.hi, lhs_value.hi);
+                        fprintf(ctx->out, "    ADDI8.F %s, #0x01\n", lhs_value.lo);
+                        fprintf(ctx->out, "    ADCI8.F %s, #0x00\n", lhs_value.hi);
+                        fprintf(ctx->out, "%s:\n", lhs_nonneg_label);
+
+                        fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", rhs_value.hi);
+                        fprintf(ctx->out, "    BGE %s\n", rhs_nonneg_label);
+                        fprintf(ctx->out, "    XORI32 %s, #0x00000001\n", sign_q);
+                        fprintf(ctx->out, "    NOT %s, %s\n", rhs_value.lo, rhs_value.lo);
+                        fprintf(ctx->out, "    NOT %s, %s\n", rhs_value.hi, rhs_value.hi);
+                        fprintf(ctx->out, "    ADDI8.F %s, #0x01\n", rhs_value.lo);
+                        fprintf(ctx->out, "    ADCI8.F %s, #0x00\n", rhs_value.hi);
+                        fprintf(ctx->out, "%s:\n", rhs_nonneg_label);
+
+                        bslash_emit_movi32_u32(ctx, count_reg, 64);
+                        fprintf(ctx->out, "%s:\n", loop_label);
+                        fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", count_reg);
+                        fprintf(ctx->out, "    BZ %s\n", done_label);
+
+                        bslash_emit_mov(ctx, tmp_a, quot_lo);
+                        fprintf(ctx->out, "    LSRI8 %s, #0x1F\n", tmp_a);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", quot_lo);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", quot_hi);
+                        fprintf(ctx->out, "    OR %s, %s\n", quot_hi, tmp_a);
+
+                        bslash_emit_mov(ctx, tmp_a, lhs_value.hi);
+                        fprintf(ctx->out, "    LSRI8 %s, #0x1F\n", tmp_a);
+                        bslash_emit_mov(ctx, tmp_b, lhs_value.lo);
+                        fprintf(ctx->out, "    LSRI8 %s, #0x1F\n", tmp_b);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", lhs_value.lo);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", lhs_value.hi);
+                        fprintf(ctx->out, "    OR %s, %s\n", lhs_value.hi, tmp_b);
+
+                        bslash_emit_mov(ctx, tmp_b, rem_lo);
+                        fprintf(ctx->out, "    LSRI8 %s, #0x1F\n", tmp_b);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", rem_lo);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", rem_hi);
+                        fprintf(ctx->out, "    OR %s, %s\n", rem_hi, tmp_b);
+                        fprintf(ctx->out, "    OR %s, %s\n", rem_lo, tmp_a);
+
+                        fprintf(ctx->out, "    CMP %s, %s\n", rem_hi, rhs_value.hi);
+                        fprintf(ctx->out, "    BLTU %s\n", skip_sub_label);
+                        fprintf(ctx->out, "    BGTU %s\n", do_sub_label);
+                        fprintf(ctx->out, "    CMP %s, %s\n", rem_lo, rhs_value.lo);
+                        fprintf(ctx->out, "    BLTU %s\n", skip_sub_label);
+                        fprintf(ctx->out, "%s:\n", do_sub_label);
+                        bslash_emit_mov(ctx, tmp_a, rhs_value.lo);
+                        fprintf(ctx->out, "    NOT %s, %s\n", tmp_a, tmp_a);
+                        bslash_emit_mov(ctx, tmp_b, rhs_value.hi);
+                        fprintf(ctx->out, "    NOT %s, %s\n", tmp_b, tmp_b);
+                        fprintf(ctx->out, "    ADDI8.F %s, #0x01\n", tmp_a);
+                        fprintf(ctx->out, "    ADCI8.F %s, #0x00\n", tmp_b);
+                        fprintf(ctx->out, "    ADD.F %s, %s\n", rem_lo, tmp_a);
+                        fprintf(ctx->out, "    ADC.F %s, %s\n", rem_hi, tmp_b);
+                        fprintf(ctx->out, "    ADDI8 %s, #0x01\n", quot_lo);
+                        fprintf(ctx->out, "%s:\n", skip_sub_label);
+                        fprintf(ctx->out, "    SUBI8 %s, #0x01\n", count_reg);
+                        fprintf(ctx->out, "    J32 %s\n", loop_label);
+                        fprintf(ctx->out, "%s:\n", done_label);
+
+                        fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", sign_q);
+                        fprintf(ctx->out, "    BZ %s\n", q_sign_done_label);
+                        fprintf(ctx->out, "    NOT %s, %s\n", quot_lo, quot_lo);
+                        fprintf(ctx->out, "    NOT %s, %s\n", quot_hi, quot_hi);
+                        fprintf(ctx->out, "    ADDI8.F %s, #0x01\n", quot_lo);
+                        fprintf(ctx->out, "    ADCI8.F %s, #0x00\n", quot_hi);
+                        fprintf(ctx->out, "%s:\n", q_sign_done_label);
+
+                        fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", sign_r);
+                        fprintf(ctx->out, "    BZ %s\n", r_sign_done_label);
+                        fprintf(ctx->out, "    NOT %s, %s\n", rem_lo, rem_lo);
+                        fprintf(ctx->out, "    NOT %s, %s\n", rem_hi, rem_hi);
+                        fprintf(ctx->out, "    ADDI8.F %s, #0x01\n", rem_lo);
+                        fprintf(ctx->out, "    ADCI8.F %s, #0x00\n", rem_hi);
+                        fprintf(ctx->out, "%s:\n", r_sign_done_label);
+                    }
+                    else
+                    {
+                        bslash_emit_movi32_u32(ctx, count_reg, 64);
+                        fprintf(ctx->out, "%s:\n", loop_label);
+                        fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", count_reg);
+                        fprintf(ctx->out, "    BZ %s\n", done_label);
+
+                        bslash_emit_mov(ctx, tmp_a, quot_lo);
+                        fprintf(ctx->out, "    LSRI8 %s, #0x1F\n", tmp_a);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", quot_lo);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", quot_hi);
+                        fprintf(ctx->out, "    OR %s, %s\n", quot_hi, tmp_a);
+
+                        bslash_emit_mov(ctx, tmp_a, lhs_value.hi);
+                        fprintf(ctx->out, "    LSRI8 %s, #0x1F\n", tmp_a);
+                        bslash_emit_mov(ctx, tmp_b, lhs_value.lo);
+                        fprintf(ctx->out, "    LSRI8 %s, #0x1F\n", tmp_b);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", lhs_value.lo);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", lhs_value.hi);
+                        fprintf(ctx->out, "    OR %s, %s\n", lhs_value.hi, tmp_b);
+
+                        bslash_emit_mov(ctx, tmp_b, rem_lo);
+                        fprintf(ctx->out, "    LSRI8 %s, #0x1F\n", tmp_b);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", rem_lo);
+                        fprintf(ctx->out, "    SHLI8 %s, #0x01\n", rem_hi);
+                        fprintf(ctx->out, "    OR %s, %s\n", rem_hi, tmp_b);
+                        fprintf(ctx->out, "    OR %s, %s\n", rem_lo, tmp_a);
+
+                        fprintf(ctx->out, "    CMP %s, %s\n", rem_hi, rhs_value.hi);
+                        fprintf(ctx->out, "    BLTU %s\n", skip_sub_label);
+                        fprintf(ctx->out, "    BGTU %s\n", do_sub_label);
+                        fprintf(ctx->out, "    CMP %s, %s\n", rem_lo, rhs_value.lo);
+                        fprintf(ctx->out, "    BLTU %s\n", skip_sub_label);
+                        fprintf(ctx->out, "%s:\n", do_sub_label);
+                        bslash_emit_mov(ctx, tmp_a, rhs_value.lo);
+                        fprintf(ctx->out, "    NOT %s, %s\n", tmp_a, tmp_a);
+                        bslash_emit_mov(ctx, tmp_b, rhs_value.hi);
+                        fprintf(ctx->out, "    NOT %s, %s\n", tmp_b, tmp_b);
+                        fprintf(ctx->out, "    ADDI8.F %s, #0x01\n", tmp_a);
+                        fprintf(ctx->out, "    ADCI8.F %s, #0x00\n", tmp_b);
+                        fprintf(ctx->out, "    ADD.F %s, %s\n", rem_lo, tmp_a);
+                        fprintf(ctx->out, "    ADC.F %s, %s\n", rem_hi, tmp_b);
+                        fprintf(ctx->out, "    ADDI8 %s, #0x01\n", quot_lo);
+                        fprintf(ctx->out, "%s:\n", skip_sub_label);
+                        fprintf(ctx->out, "    SUBI8 %s, #0x01\n", count_reg);
+                        fprintf(ctx->out, "    J32 %s\n", loop_label);
+                        fprintf(ctx->out, "%s:\n", done_label);
+                    }
+
+                    if (ins->data.binop.op == CC_BINOP_DIV)
+                    {
+                        bslash_emit_mov(ctx, lhs_value.lo, quot_lo);
+                        bslash_emit_mov(ctx, lhs_value.hi, quot_hi);
+                    }
+                    else
+                    {
+                        bslash_emit_mov(ctx, lhs_value.lo, rem_lo);
+                        bslash_emit_mov(ctx, lhs_value.hi, rem_hi);
+                    }
+
+                    if (sign_r)
+                        bslash_scratch_release(ctx);
+                    if (sign_q)
+                        bslash_scratch_release(ctx);
+                    bslash_scratch_release(ctx); /* tmp_b */
+                    bslash_scratch_release(ctx); /* tmp_a */
+                    bslash_scratch_release(ctx); /* count_reg */
+                    bslash_scratch_release(ctx); /* rem_hi */
+                    bslash_scratch_release(ctx); /* rem_lo */
+                    bslash_scratch_release(ctx); /* quot_hi */
+                    bslash_scratch_release(ctx); /* quot_lo */
                     break;
                 }
                 case CC_BINOP_SHR:
@@ -3853,6 +4228,86 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     fprintf(ctx->out, "    ASRI8 %s, #0x1F\n", output_value.hi);
                     bslash_clear_register_info(ctx, output_value.hi);
                     break;
+                case CC_CONVERT_F2I:
+                    /* BSlash has FP32 conversion in-register; use low word as source payload. */
+                    bslash_ensure_register_materialized(ctx, input_value.lo);
+                    fprintf(ctx->out, "    FTOI %s, %s\n", output_value.lo, input_value.lo);
+                    bslash_clear_register_info(ctx, output_value.lo);
+                    if (cc_value_type_is_signed(ins->data.convert.to_type))
+                    {
+                        bslash_emit_mov(ctx, output_value.hi, output_value.lo);
+                        fprintf(ctx->out, "    ASRI8 %s, #0x1F\n", output_value.hi);
+                    }
+                    else
+                    {
+                        bslash_emit_movi32_u32(ctx, output_value.hi, 0);
+                    }
+                    bslash_clear_register_info(ctx, output_value.hi);
+                    break;
+                case CC_CONVERT_I2F:
+                {
+                    const char *tmp0 = bslash_scratch_acquire(ctx, ins->line);
+                    const char *tmp1 = bslash_scratch_acquire(ctx, ins->line);
+                    if (!tmp0 || !tmp1)
+                    {
+                        if (tmp1)
+                            bslash_scratch_release(ctx);
+                        if (tmp0)
+                            bslash_scratch_release(ctx);
+                        bslash_release_value(ctx, input_value);
+                        bslash_release_value(ctx, output_value);
+                        success = false;
+                        goto cleanup;
+                    }
+
+                    /* Conservative lowering: convert through FP32 payload then widen bits to FP64 layout. */
+                    bslash_emit_mov(ctx, tmp0, input_value.lo);
+                    bslash_ensure_register_materialized(ctx, tmp0);
+                    fprintf(ctx->out, "    ITOF %s, %s\n", output_value.lo, tmp0);
+                    bslash_clear_register_info(ctx, output_value.lo);
+
+                    char zero_label[128];
+                    char done_label[128];
+                    bslash_make_temp_label(ctx, zero_label, sizeof(zero_label), "conv_i2f64_zero");
+                    bslash_make_temp_label(ctx, done_label, sizeof(done_label), "conv_i2f64_done");
+
+                    fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", output_value.lo);
+                    fprintf(ctx->out, "    BZ %s\n", zero_label);
+
+                    /* sign -> bit63 */
+                    bslash_emit_mov(ctx, output_value.hi, output_value.lo);
+                    fprintf(ctx->out, "    ANDI32 %s, #0x80000000\n", output_value.hi);
+
+                    /* exp64 = (exp32 + (1023-127)) << 20 */
+                    bslash_emit_mov(ctx, tmp0, output_value.lo);
+                    fprintf(ctx->out, "    LSRI8 %s, #0x17\n", tmp0);
+                    fprintf(ctx->out, "    ANDI32 %s, #0x000000FF\n", tmp0);
+                    bslash_emit_addi(ctx, tmp0, 896);
+                    fprintf(ctx->out, "    SHLI8 %s, #0x14\n", tmp0);
+                    fprintf(ctx->out, "    OR %s, %s\n", output_value.hi, tmp0);
+
+                    /* mantissa: hi20 = frac>>3, lo32 = (frac&7)<<29 */
+                    bslash_emit_mov(ctx, tmp1, output_value.lo);
+                    fprintf(ctx->out, "    ANDI32 %s, #0x007FFFFF\n", tmp1);
+                    bslash_emit_mov(ctx, tmp0, tmp1);
+                    fprintf(ctx->out, "    LSRI8 %s, #0x03\n", tmp0);
+                    fprintf(ctx->out, "    OR %s, %s\n", output_value.hi, tmp0);
+                    fprintf(ctx->out, "    ANDI32 %s, #0x00000007\n", tmp1);
+                    fprintf(ctx->out, "    SHLI8 %s, #0x1D\n", tmp1);
+                    bslash_emit_mov(ctx, output_value.lo, tmp1);
+                    fprintf(ctx->out, "    J32 %s\n", done_label);
+
+                    fprintf(ctx->out, "%s:\n", zero_label);
+                    bslash_emit_movi32_u32(ctx, output_value.lo, 0);
+                    bslash_emit_movi32_u32(ctx, output_value.hi, 0);
+                    fprintf(ctx->out, "%s:\n", done_label);
+
+                    bslash_clear_register_info(ctx, output_value.lo);
+                    bslash_clear_register_info(ctx, output_value.hi);
+                    bslash_scratch_release(ctx);
+                    bslash_scratch_release(ctx);
+                    break;
+                }
                 default:
                     handled = false;
                     break;
@@ -3882,6 +4337,11 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 case CC_CONVERT_TRUNC:
                     bslash_emit_mov(ctx, dst, input_value.lo);
                     break;
+                case CC_CONVERT_I2F:
+                    bslash_ensure_register_materialized(ctx, input_value.lo);
+                    fprintf(ctx->out, "    ITOF %s, %s\n", dst, input_value.lo);
+                    bslash_clear_register_info(ctx, dst);
+                    break;
                 default:
                     handled = false;
                     break;
@@ -3908,6 +4368,33 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     fprintf(ctx->out, "    ANDI32 %s, #0x%08" PRIX32 "\n", value, mask);
                     bslash_clear_register_info(ctx, value);
                 }
+                break;
+            }
+            case CC_CONVERT_F2I:
+            {
+                bslash_ensure_register_materialized(ctx, value);
+                fprintf(ctx->out, "    FTOI %s, %s\n", value, value);
+                bslash_clear_register_info(ctx, value);
+
+                if (to_bits > 0 && to_bits < 32)
+                {
+                    uint32_t mask = (1u << to_bits) - 1u;
+                    fprintf(ctx->out, "    ANDI32 %s, #0x%08" PRIX32 "\n", value, mask);
+                    if (cc_value_type_is_signed(ins->data.convert.to_type))
+                    {
+                        uint32_t shift = 32u - (uint32_t)to_bits;
+                        fprintf(ctx->out, "    SHLI8 %s, #0x%02" PRIX32 "\n", value, shift);
+                        fprintf(ctx->out, "    ASRI8 %s, #0x%02" PRIX32 "\n", value, shift);
+                    }
+                    bslash_clear_register_info(ctx, value);
+                }
+                break;
+            }
+            case CC_CONVERT_I2F:
+            {
+                bslash_ensure_register_materialized(ctx, value);
+                fprintf(ctx->out, "    ITOF %s, %s\n", value, value);
+                bslash_clear_register_info(ctx, value);
                 break;
             }
             case CC_CONVERT_SEXT:
