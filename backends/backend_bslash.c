@@ -4666,27 +4666,16 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 bslash_forget_call_result_register_values(ctx);
                 if (ins->data.call.return_type != CC_TYPE_VOID)
                 {
-                    if (bslash_value_is_wide(ins->data.call.return_type))
+                    BSlashValue result;
+                    result.type = ins->data.call.return_type;
+                    result.lo = "B0"; // Tell the stack the value is in B0
+                    result.hi = bslash_value_is_wide(result.type) ? "B1" : NULL;
+
+                    // skip mov
+                    if (!bslash_stack_push_existing_typed(ctx, ins->line, result))
                     {
-                        BSlashValue return_value;
-                        if (!bslash_stack_push_new_typed(ctx, ins->line, ins->data.call.return_type, &return_value))
-                        {
-                            success = false;
-                            goto cleanup;
-                        }
-                        bslash_emit_mov(ctx, return_value.lo, "B0");
-                        bslash_emit_mov(ctx, return_value.hi, "B1");
-                    }
-                    else
-                    {
-                        const char *dst = NULL;
-                        if (!bslash_stack_push_new(ctx, ins->line, &dst))
-                        {
-                            success = false;
-                            goto cleanup;
-                        }
-                        if (strcmp(dst, "B0") != 0)
-                            bslash_emit_mov(ctx, dst, "B0");
+                        success = false;
+                        goto cleanup;
                     }
                 }
             }
@@ -4698,51 +4687,31 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         {
             if (ins->data.ret.has_value)
             {
-                BSlashValue return_value;
-                if (!bslash_stack_pop_value(ctx, ins->line, &return_value))
+                BSlashValue val;
+                if (!bslash_stack_pop_value(ctx, ins->line, &val))
                 {
                     success = false;
                     goto cleanup;
                 }
-                if (bslash_value_is_wide(return_value.type))
+
+                // ONLY move if the value isn't already in B0
+                if (strcmp(val.lo, "B0") != 0)
                 {
-                    bslash_ensure_value_materialized(ctx, return_value);
-                    bslash_emit_mov(ctx, "B0", return_value.lo);
-                    bslash_emit_mov(ctx, "B1", return_value.hi);
-                    bslash_release_value(ctx, return_value);
+                    bslash_emit_mov(ctx, "B0", val.lo);
                 }
-                else
+                
+                if (val.hi && strcmp(val.hi, "B1") != 0)
                 {
-                    bool optimized_return = false;
-                    const char *value = return_value.lo;
-                    if (ctx->opt_level >= 3)
-                    {
-                        uint32_t const_value = 0;
-                        if (bslash_get_register_const(ctx, value, &const_value))
-                        {
-                            bslash_emit_movi32_u32(ctx, "B0", const_value);
-                            optimized_return = true;
-                        }
-                        else
-                        {
-                            const char *label = bslash_get_register_label(ctx, value);
-                            if (label)
-                            {
-                                bslash_emit_movi32_label(ctx, "B0", label);
-                                optimized_return = true;
-                            }
-                        }
-                    }
-                    if (!optimized_return && strcmp(value, "B0") != 0)
-                        bslash_emit_mov(ctx, "B0", value);
-                    bslash_release_value(ctx, return_value);
+                    bslash_emit_mov(ctx, "B1", val.hi);
                 }
             }
             if (!fn->is_noreturn)
             {
-                if (ctx->frame_size_bytes > 0)
-                    fprintf(ctx->out, "    LEAVE\n");
-                fprintf(ctx->out, "    RET\n");
+                // check if this RET is the last instruction -- Nathan H | Tue Apr 21, 2026, 17:50
+                if (ins != &fn->instructions[fn->instruction_count - 1])
+                {
+                    fprintf(ctx->out, "    J32 %s__epilogue\n", fn->name);
+                }
             }
             bslash_stack_reset(ctx);
             if (ctx->opt_level >= 3)
@@ -4876,6 +4845,7 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
 
     if (!fn->is_noreturn)
     {
+        fprintf(ctx->out, "%s__epilogue:\n", fn->name);
         if (ctx->frame_size_bytes > 0)
             fprintf(ctx->out, "    LEAVE\n");
         fprintf(ctx->out, "    RET\n");
