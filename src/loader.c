@@ -1094,7 +1094,7 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
         for (size_t ins_index = 0; ins_index < instr_count; ++ins_index)
         {
             uint8_t kind_byte = 0;
-            if (!ccbin_read_u8(file, &kind_byte) || kind_byte > (uint8_t)CC_INSTR_DUP)
+            if (!ccbin_read_u8(file, &kind_byte) || kind_byte > (uint8_t)CC_INSTR_BR_TEST_ZERO)
             {
                 if (sink)
                     cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid instruction kind in function index %zu", i);
@@ -1388,6 +1388,66 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
                     goto fail;
                 }
                 ins->data.dup.type = ty;
+                break;
+            }
+            case CC_INSTR_ADDR_INDEX_PTR:
+            {
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid addr_index_ptr type in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.addr_index_ptr.index_type = ty;
+                break;
+            }
+            case CC_INSTR_LOADSX_INDIRECT:
+            case CC_INSTR_LOADZX_INDIRECT:
+            {
+                CCValueType from = CC_TYPE_INVALID;
+                CCValueType to = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &from) || !ccbin_read_value_type(file, &to))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid ext-load types in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.ext_load.from_type = from;
+                ins->data.ext_load.to_type = to;
+                break;
+            }
+            case CC_INSTR_BR_TEST_ZERO:
+            {
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid br_test_zero type in function index %zu", i);
+                    goto fail;
+                }
+                bool is_unsigned = false;
+                if (!ccbin_read_bool(file, &is_unsigned))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated br_test_zero flag in function index %zu", i);
+                    goto fail;
+                }
+                char *true_target = NULL;
+                char *false_target = NULL;
+                if (!ccbin_read_cstring(file, &true_target, false) ||
+                    !ccbin_read_cstring(file, &false_target, false))
+                {
+                    free(true_target);
+                    free(false_target);
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid br_test_zero labels in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.br_test_zero.test_type = ty;
+                ins->data.br_test_zero.is_unsigned = is_unsigned;
+                ins->data.br_test_zero.true_target = true_target;
+                ins->data.br_test_zero.false_target = false_target;
                 break;
             }
             case CC_INSTR_CONVERT:
@@ -2751,6 +2811,101 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             return false;
         ins->data.memory.type = ty;
         ins->data.memory.is_unsigned = !cc_value_type_is_signed(ty);
+        return true;
+    }
+
+    if (strcmp(mnemonic, "addr_index_ptr") == 0)
+    {
+        const char *int_ty_tok = strtok(NULL, " \t");
+        if (!int_ty_tok)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "addr_index_ptr requires <i32|i64>");
+            return false;
+        }
+        CCValueType int_ty = parse_type_token(int_ty_tok);
+        if (int_ty != CC_TYPE_I32 && int_ty != CC_TYPE_I64)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "addr_index_ptr type must be i32 or i64, got '%s'", int_ty_tok);
+            return false;
+        }
+
+        ins = append_instruction(st, fn, CC_INSTR_ADDR_INDEX_PTR);
+        if (!ins)
+            return false;
+        ins->data.addr_index_ptr.index_type = int_ty;
+        return true;
+    }
+
+    if (strcmp(mnemonic, "loadsx_indirect") == 0 || strcmp(mnemonic, "loadzx_indirect") == 0)
+    {
+        const char *from_tok = strtok(NULL, " \t");
+        const char *to_tok = strtok(NULL, " \t");
+        if (!from_tok || !to_tok)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "%s requires <from-type> <to-type>", mnemonic);
+            return false;
+        }
+
+        CCValueType from_ty = parse_type_token(from_tok);
+        CCValueType to_ty = parse_type_token(to_tok);
+        if (from_ty == CC_TYPE_INVALID || to_ty == CC_TYPE_INVALID || from_ty == CC_TYPE_VOID || to_ty == CC_TYPE_VOID)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "invalid loadsx/loadzx types '%s' -> '%s'", from_tok, to_tok);
+            return false;
+        }
+        if (!cc_value_type_is_integer(from_ty) || !cc_value_type_is_integer(to_ty))
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "%s currently supports integer types only", mnemonic);
+            return false;
+        }
+
+        ins = append_instruction(st, fn,
+                                 (strcmp(mnemonic, "loadsx_indirect") == 0) ? CC_INSTR_LOADSX_INDIRECT : CC_INSTR_LOADZX_INDIRECT);
+        if (!ins)
+            return false;
+        ins->data.ext_load.from_type = from_ty;
+        ins->data.ext_load.to_type = to_ty;
+        return true;
+    }
+
+    if (strcmp(mnemonic, "br_test_zero") == 0)
+    {
+        const char *type_tok = strtok(NULL, " \t");
+        const char *true_tok = strtok(NULL, " \t");
+        const char *false_tok = strtok(NULL, " \t");
+        const char *flag_tok = strtok(NULL, " \t");
+        if (!type_tok || !true_tok || !false_tok)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "br_test_zero requires <type> <true-label> <false-label> [unsigned]");
+            return false;
+        }
+
+        CCValueType ty = parse_type_token(type_tok);
+        if (ty == CC_TYPE_INVALID || ty == CC_TYPE_VOID)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "invalid br_test_zero type '%s'", type_tok);
+            return false;
+        }
+
+        bool is_unsigned = false;
+        if (flag_tok)
+        {
+            if (strcmp(flag_tok, "unsigned") == 0)
+                is_unsigned = true;
+            else
+            {
+                loader_diag(st, CC_DIAG_ERROR, st->line, "unexpected br_test_zero flag '%s'", flag_tok);
+                return false;
+            }
+        }
+
+        ins = append_instruction(st, fn, CC_INSTR_BR_TEST_ZERO);
+        if (!ins)
+            return false;
+        ins->data.br_test_zero.test_type = ty;
+        ins->data.br_test_zero.is_unsigned = is_unsigned;
+        ins->data.br_test_zero.true_target = duplicate_token(true_tok);
+        ins->data.br_test_zero.false_target = duplicate_token(false_tok);
         return true;
     }
 

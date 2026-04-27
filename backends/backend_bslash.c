@@ -90,6 +90,10 @@ typedef struct
     bool *local_needs_memory;
     const char **local_registers;
     int *local_register_indices;
+    const char **local_addr_registers;
+    int *local_addr_indices;
+    const char **local_addr_hi_registers;
+    int *local_addr_hi_indices;
     size_t local_count;
     size_t *local_offsets;
     size_t frame_size_bytes;
@@ -108,6 +112,10 @@ typedef struct
     int opt_level;
     size_t temp_label_counter;
     bool enable_local_value_folding;
+    bool pending_compare_valid;
+    const char *pending_compare_result_reg;
+    const char *pending_compare_branch_op;
+    const char *pending_compare_false_branch_op;
 } BSlashFunctionContext;
 
 static const char *bslash_require_local_storage(BSlashFunctionContext *ctx, size_t index);
@@ -130,6 +138,10 @@ static void bslash_set_register_const(BSlashFunctionContext *ctx, const char *re
 static bool bslash_get_register_const(BSlashFunctionContext *ctx, const char *reg, uint32_t *out_value);
 static void bslash_emit_mov(BSlashFunctionContext *ctx, const char *dst, const char *src);
 static void bslash_emit_movi32_u32(BSlashFunctionContext *ctx, const char *dst, uint32_t value);
+static const char *bslash_get_local_addr_register(const BSlashFunctionContext *ctx, size_t local_index);
+static const char *bslash_get_local_addr_hi_register(const BSlashFunctionContext *ctx, size_t local_index);
+static bool bslash_prepare_local_addr_cache(BSlashFunctionContext *ctx, const CCFunction *fn);
+static bool bslash_emit_local_addr_into(BSlashFunctionContext *ctx, size_t line, size_t local_index, const char *dst);
 
 static bool bslash_local_fold_enabled(const BSlashFunctionContext *ctx)
 {
@@ -463,13 +475,14 @@ static void bslash_emit_global_definition(FILE *out, const CCModule *module, con
         return;
 
     size_t align_bytes = global->alignment ? global->alignment : bslash_global_type_size(global->type);
-    if (align_bytes < 4)
-        align_bytes = 4;
-    if (align_bytes < 4)
-        align_bytes = 4;
+    if (align_bytes < 8)
+        align_bytes = 8;
     size_t storage_size = bslash_global_storage_size(global);
     if (storage_size == 0)
         storage_size = 1;
+    // Ensure storage is at least as large as alignment requirement
+    if (storage_size < align_bytes)
+        storage_size = align_bytes;
 
     char resolved_name[256];
     const char *global_name = bslash_resolve_symbol_name(module, global->name, resolved_name, sizeof(resolved_name));
@@ -669,6 +682,35 @@ static bool bslash_is_param_register(const char *reg)
     return false;
 }
 
+static size_t bslash_param_word_count(const CCFunction *fn)
+{
+    size_t words = 0;
+    if (!fn)
+        return 0;
+    if (fn->is_varargs)
+        return BSLASH_PARAM_REG_COUNT;
+    if (!fn->param_types)
+        return 0;
+    for (size_t i = 0; i < fn->param_count; ++i)
+        words += bslash_value_is_wide(fn->param_types[i]) ? 2u : 1u;
+    if (words > BSLASH_PARAM_REG_COUNT)
+        words = BSLASH_PARAM_REG_COUNT;
+    return words;
+}
+
+static bool bslash_register_holds_live_param_word(const BSlashFunctionContext *ctx, const char *reg)
+{
+    if (!ctx || !ctx->fn || !reg || ctx->spill_params)
+        return false;
+    size_t words = bslash_param_word_count(ctx->fn);
+    for (size_t i = 0; i < words; ++i)
+    {
+        if (strcmp(reg, kParamRegs[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
 static int bslash_find_free_register(BSlashFunctionContext *ctx, bool prefer_high)
 {
     if (!ctx)
@@ -757,7 +799,10 @@ static void bslash_emit_movi32_u32(BSlashFunctionContext *ctx, const char *dst, 
 {
     if (!ctx || !dst)
         return;
-    fprintf(ctx->out, "    MOVI32 %s, #0x%08" PRIx32 "\n", dst, value);
+    if (value == 0)
+        fprintf(ctx->out, "    XOR %s, %s\n", dst, dst);
+    else
+        fprintf(ctx->out, "    MOVI32 %s, #0x%08" PRIx32 "\n", dst, value);
     bslash_set_register_const(ctx, dst, value, true);
 }
 
@@ -912,9 +957,11 @@ static void bslash_ensure_register_materialized(BSlashFunctionContext *ctx, cons
         {
             if (!ctx->local_offsets || (size_t)local_idx >= ctx->local_count || ctx->local_offsets[local_idx] == 0)
                 return;
-            fprintf(ctx->out, "    RDFR %s\n", reg);
-            bslash_clear_register_info(ctx, reg);
-            bslash_emit_addi(ctx, reg, -(int32_t)ctx->local_offsets[local_idx]);
+            const char *cached = bslash_get_local_addr_register(ctx, (size_t)local_idx);
+            if (cached)
+                bslash_emit_mov(ctx, reg, cached);
+            else if (!bslash_emit_local_addr_into(ctx, 0, (size_t)local_idx, reg))
+                return;
             bslash_set_register_label(ctx, reg, label, true);
             return;
         }
@@ -946,9 +993,11 @@ static void bslash_emit_mov(BSlashFunctionContext *ctx, const char *dst, const c
             {
                 if (!ctx->local_offsets || (size_t)local_idx >= ctx->local_count || ctx->local_offsets[local_idx] == 0)
                     return;
-                fprintf(ctx->out, "    RDFR %s\n", dst);
-                bslash_clear_register_info(ctx, dst);
-                bslash_emit_addi(ctx, dst, -(int32_t)ctx->local_offsets[local_idx]);
+                const char *cached = bslash_get_local_addr_register(ctx, (size_t)local_idx);
+                if (cached)
+                    bslash_emit_mov(ctx, dst, cached);
+                else if (!bslash_emit_local_addr_into(ctx, 0, (size_t)local_idx, dst))
+                    return;
                 bslash_set_register_label(ctx, dst, label, true);
                 return;
             }
@@ -1153,6 +1202,33 @@ static const char *bslash_compare_false_branch_opcode(CCCompareOp op, bool is_un
     default:
         return NULL;
     }
+}
+
+static const char *bslash_invert_branch_opcode(const char *branch_op)
+{
+    if (!branch_op)
+        return NULL;
+    if (strcmp(branch_op, "BZ") == 0)
+        return "BNZ";
+    if (strcmp(branch_op, "BNZ") == 0)
+        return "BZ";
+    if (strcmp(branch_op, "BLT") == 0)
+        return "BGE";
+    if (strcmp(branch_op, "BGE") == 0)
+        return "BLT";
+    if (strcmp(branch_op, "BLE") == 0)
+        return "BGT";
+    if (strcmp(branch_op, "BGT") == 0)
+        return "BLE";
+    if (strcmp(branch_op, "BLTU") == 0)
+        return "BGEU";
+    if (strcmp(branch_op, "BGEU") == 0)
+        return "BLTU";
+    if (strcmp(branch_op, "BLEU") == 0)
+        return "BGTU";
+    if (strcmp(branch_op, "BGTU") == 0)
+        return "BLEU";
+    return NULL;
 }
 
 static const char *bslash_load_mnemonic(CCValueType type, bool is_unsigned)
@@ -2093,6 +2169,141 @@ static void bslash_local_release_register(BSlashFunctionContext *ctx, size_t loc
         ctx->local_registers[local_index] = NULL;
 }
 
+static const char *bslash_get_local_addr_register(const BSlashFunctionContext *ctx, size_t local_index)
+{
+    if (!ctx || !ctx->local_addr_registers || local_index >= ctx->local_count)
+        return NULL;
+    return ctx->local_addr_registers[local_index];
+}
+
+static const char *bslash_get_local_addr_hi_register(const BSlashFunctionContext *ctx, size_t local_index)
+{
+    if (!ctx || !ctx->local_addr_hi_registers || local_index >= ctx->local_count)
+        return NULL;
+    return ctx->local_addr_hi_registers[local_index];
+}
+
+static bool bslash_emit_local_addr_into(BSlashFunctionContext *ctx, size_t line, size_t local_index, const char *dst)
+{
+    if (!ctx || !dst || local_index >= ctx->local_count)
+        return false;
+    const char *cached = bslash_get_local_addr_register(ctx, local_index);
+    if (cached)
+    {
+        if (strcmp(dst, cached) != 0)
+            bslash_emit_mov(ctx, dst, cached);
+        return true;
+    }
+    fprintf(ctx->out, "    RDFR %s\n", dst);
+    bslash_clear_register_info(ctx, dst);
+    bslash_emit_addi(ctx, dst, -(int32_t)ctx->local_offsets[local_index]);
+    return true;
+}
+
+static bool bslash_prepare_local_addr_cache(BSlashFunctionContext *ctx, const CCFunction *fn)
+{
+    if (!ctx || !fn || ctx->local_count == 0)
+        return true;
+
+    ctx->local_addr_registers = (const char **)calloc(ctx->local_count, sizeof(const char *));
+    ctx->local_addr_indices = (int *)calloc(ctx->local_count, sizeof(int));
+    ctx->local_addr_hi_registers = (const char **)calloc(ctx->local_count, sizeof(const char *));
+    ctx->local_addr_hi_indices = (int *)calloc(ctx->local_count, sizeof(int));
+    if (!ctx->local_addr_registers || !ctx->local_addr_indices || !ctx->local_addr_hi_registers || !ctx->local_addr_hi_indices)
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "out of memory allocating local address cache");
+        return false;
+    }
+    for (size_t i = 0; i < ctx->local_count; ++i)
+    {
+        ctx->local_addr_indices[i] = -1;
+        ctx->local_addr_hi_indices[i] = -1;
+    }
+
+    if (ctx->opt_level < 2 || ctx->local_count > 6)
+        return true;
+
+    for (size_t ii = 0; ii < fn->instruction_count; ++ii)
+    {
+        const CCInstruction *ins = &fn->instructions[ii];
+        if (!ins)
+            continue;
+        if (ins->kind == CC_INSTR_CALL || ins->kind == CC_INSTR_CALL_INDIRECT)
+            return true;
+    }
+
+    bool blocked[BSLASH_VALUE_STACK_CAPACITY] = {false};
+    size_t param_words = 0;
+    if (fn->is_varargs)
+    {
+        param_words = BSLASH_PARAM_REG_COUNT;
+    }
+    else if (fn->param_types)
+    {
+        for (size_t i = 0; i < fn->param_count; ++i)
+            param_words += bslash_value_is_wide(fn->param_types[i]) ? 2u : 1u;
+    }
+    if (param_words > BSLASH_PARAM_REG_COUNT)
+        param_words = BSLASH_PARAM_REG_COUNT;
+    for (size_t w = 0; w < param_words; ++w)
+    {
+        int idx = bslash_register_index(kParamRegs[w]);
+        if (idx >= 0)
+            blocked[idx] = true;
+    }
+
+    for (size_t local_index = 0; local_index < ctx->local_count; ++local_index)
+    {
+        if (!ctx->local_needs_memory || !ctx->local_needs_memory[local_index])
+            continue;
+        if (!ctx->local_offsets || ctx->local_offsets[local_index] == 0)
+            continue;
+
+        int chosen = -1;
+        /* Aggressively allocate from all B0-B15 GPRs, starting from high numbers to avoid trampling common registers */
+        for (int idx = 15; idx >= 0; --idx)
+        {
+            if (blocked[idx] || ctx->reg_reserved[idx] || ctx->reg_in_use[idx])
+                continue;
+            chosen = idx;
+            break;
+        }
+        if (chosen < 0)
+            break;
+
+        ctx->local_addr_indices[local_index] = chosen;
+        ctx->local_addr_registers[local_index] = kValueStackOrder[chosen];
+        ctx->reg_reserved[chosen] = true;
+        ctx->reg_in_use[chosen] = true;
+        bslash_clear_register_info(ctx, kValueStackOrder[chosen]);
+
+        CCValueType local_type = (fn && fn->local_types && local_index < fn->local_count) ? fn->local_types[local_index] : CC_TYPE_I32;
+        if (bslash_value_is_wide(local_type))
+        {
+            int chosen_hi = -1;
+            for (int idx = 15; idx >= 0; --idx)
+            {
+                if (idx == chosen)
+                    continue;
+                if (blocked[idx] || ctx->reg_reserved[idx] || ctx->reg_in_use[idx])
+                    continue;
+                chosen_hi = idx;
+                break;
+            }
+            if (chosen_hi >= 0)
+            {
+                ctx->local_addr_hi_indices[local_index] = chosen_hi;
+                ctx->local_addr_hi_registers[local_index] = kValueStackOrder[chosen_hi];
+                ctx->reg_reserved[chosen_hi] = true;
+                ctx->reg_in_use[chosen_hi] = true;
+                bslash_clear_register_info(ctx, kValueStackOrder[chosen_hi]);
+            }
+        }
+    }
+
+    return true;
+}
+
 static bool bslash_local_bind_register(BSlashFunctionContext *ctx, size_t local_index, const char *reg)
 {
     if (!ctx || !reg || !ctx->local_register_indices || local_index >= ctx->local_count)
@@ -2184,6 +2395,14 @@ static void bslash_function_cleanup(BSlashFunctionContext *ctx)
     ctx->local_registers = NULL;
     free(ctx->local_register_indices);
     ctx->local_register_indices = NULL;
+    free(ctx->local_addr_registers);
+    ctx->local_addr_registers = NULL;
+    free(ctx->local_addr_indices);
+    ctx->local_addr_indices = NULL;
+    free(ctx->local_addr_hi_registers);
+    ctx->local_addr_hi_registers = NULL;
+    free(ctx->local_addr_hi_indices);
+    ctx->local_addr_hi_indices = NULL;
     free(ctx->local_offsets);
     ctx->local_offsets = NULL;
     free(ctx->param_word_offsets);
@@ -2431,16 +2650,26 @@ static bool bslash_local_materialize(BSlashFunctionContext *ctx, size_t index, s
         return true;
     if (!bslash_require_local_storage(ctx, index))
         return false;
-    const char *addr_reg = bslash_scratch_acquire(ctx, line);
+    const char *cached_addr = bslash_get_local_addr_register(ctx, index);
+    const char *addr_reg = cached_addr;
+    bool addr_is_scratch = false;
     if (!addr_reg)
-        return false;
-    fprintf(ctx->out, "    RDFR %s\n", addr_reg);
-    bslash_clear_register_info(ctx, addr_reg);
-    bslash_emit_addi(ctx, addr_reg, -(int32_t)ctx->local_offsets[index]);
+    {
+        addr_reg = bslash_scratch_acquire(ctx, line);
+        if (!addr_reg)
+            return false;
+        addr_is_scratch = true;
+        if (!bslash_emit_local_addr_into(ctx, line, index, addr_reg))
+        {
+            bslash_scratch_release(ctx);
+            return false;
+        }
+    }
     const char *value_reg = bslash_scratch_acquire(ctx, line);
     if (!value_reg)
     {
-        bslash_scratch_release(ctx);
+        if (addr_is_scratch)
+            bslash_scratch_release(ctx);
         return false;
     }
     if (ctx->local_known_values && ctx->local_known_values[index])
@@ -2459,7 +2688,8 @@ static bool bslash_local_materialize(BSlashFunctionContext *ctx, size_t index, s
     }
     fprintf(ctx->out, "    ST [%s], %s\n", addr_reg, value_reg);
     bslash_scratch_release(ctx);
-    bslash_scratch_release(ctx);
+    if (addr_is_scratch)
+        bslash_scratch_release(ctx);
     bslash_local_mark_clean(ctx, index);
     return true;
 }
@@ -2500,6 +2730,10 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
     ctx->local_needs_memory = NULL;
     ctx->local_registers = NULL;
     ctx->local_register_indices = NULL;
+    ctx->local_addr_registers = NULL;
+    ctx->local_addr_indices = NULL;
+    ctx->local_addr_hi_registers = NULL;
+    ctx->local_addr_hi_indices = NULL;
     ctx->local_offsets = NULL;
     ctx->frame_size_bytes = 0;
     ctx->spill_params = false;
@@ -2511,6 +2745,10 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
     ctx->local_known_labels = NULL;
     ctx->local_materialized = NULL;
     ctx->local_storage_registered = NULL;
+    ctx->pending_compare_valid = false;
+    ctx->pending_compare_result_reg = NULL;
+    ctx->pending_compare_branch_op = NULL;
+    ctx->pending_compare_false_branch_op = NULL;
     /*
      * Local value folding is currently too aggressive for some pointer-heavy
      * MMIO store chains (e.g. GDP register writes) and can rewrite stores to
@@ -2537,19 +2775,27 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         }
     }
 
+    bool has_call_like = false;
+    bool has_load_param = false;
+    bool has_addr_param = false;
     for (size_t ii = 0; ii < fn->instruction_count; ++ii)
     {
         const CCInstruction *ins = &fn->instructions[ii];
         if (!ins)
             continue;
-        if (ins->kind == CC_INSTR_CALL ||
-            ins->kind == CC_INSTR_CALL_INDIRECT ||
-            ins->kind == CC_INSTR_ADDR_PARAM)
-        {
-            ctx->spill_params = true;
-            break;
-        }
+        if (ins->kind == CC_INSTR_CALL || ins->kind == CC_INSTR_CALL_INDIRECT)
+            has_call_like = true;
+        else if (ins->kind == CC_INSTR_LOAD_PARAM)
+            has_load_param = true;
+        else if (ins->kind == CC_INSTR_ADDR_PARAM)
+            has_addr_param = true;
     }
+
+    /*
+     * Spill parameters only when they must survive call-clobbering or
+     * when their address is explicitly required.
+     */
+    ctx->spill_params = has_addr_param || (has_call_like && has_load_param);
 
     bool success = true;
     if (ctx->local_count > 0)
@@ -2596,6 +2842,11 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         success = false;
         goto cleanup;
     }
+    if (!bslash_prepare_local_addr_cache(ctx, fn))
+    {
+        success = false;
+        goto cleanup;
+    }
 
     fprintf(ctx->out, "%s:\n", fn->name);
 
@@ -2615,6 +2866,29 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         }
         bslash_clear_register_info(ctx, "B8");
         bslash_clear_register_info(ctx, "B9");
+    }
+
+    if (ctx->local_addr_registers && ctx->local_offsets)
+    {
+        for (size_t local_index = 0; local_index < ctx->local_count; ++local_index)
+        {
+            const char *addr_reg = bslash_get_local_addr_register(ctx, local_index);
+            if (!addr_reg)
+                continue;
+            fprintf(ctx->out, "    RDFR %s\n", addr_reg);
+            bslash_clear_register_info(ctx, addr_reg);
+            bslash_emit_addi(ctx, addr_reg, -(int32_t)ctx->local_offsets[local_index]);
+            bslash_clear_register_info(ctx, addr_reg);
+
+            const char *addr_hi_reg = bslash_get_local_addr_hi_register(ctx, local_index);
+            if (addr_hi_reg)
+            {
+                fprintf(ctx->out, "    RDFR %s\n", addr_hi_reg);
+                bslash_clear_register_info(ctx, addr_hi_reg);
+                bslash_emit_addi(ctx, addr_hi_reg, -(int32_t)ctx->local_offsets[local_index] + 4);
+                bslash_clear_register_info(ctx, addr_hi_reg);
+            }
+        }
     }
 
     if (fn->is_literal)
@@ -2639,13 +2913,54 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         if (!ins)
             continue;
 
+        if (ctx->pending_compare_valid && ins->kind != CC_INSTR_BRANCH)
+        {
+            ctx->pending_compare_valid = false;
+            ctx->pending_compare_result_reg = NULL;
+            ctx->pending_compare_branch_op = NULL;
+            ctx->pending_compare_false_branch_op = NULL;
+        }
+
         switch (ins->kind)
         {
         case CC_INSTR_CONST:
         {
-            uint64_t value = (uint64_t)ins->data.constant.value.i64;
+            uint64_t value = 0;
             if (ins->data.constant.is_null)
+            {
                 value = 0;
+            }
+            else
+            {
+                switch (ins->data.constant.type)
+                {
+                case CC_TYPE_F32:
+                {
+                    union
+                    {
+                        float f;
+                        uint32_t u;
+                    } conv;
+                    conv.f = ins->data.constant.value.f32;
+                    value = (uint64_t)conv.u;
+                    break;
+                }
+                case CC_TYPE_F64:
+                {
+                    union
+                    {
+                        double f;
+                        uint64_t u;
+                    } conv;
+                    conv.f = ins->data.constant.value.f64;
+                    value = conv.u;
+                    break;
+                }
+                default:
+                    value = (uint64_t)ins->data.constant.value.i64;
+                    break;
+                }
+            }
             if (bslash_value_is_wide(ins->data.constant.type))
             {
                 BSlashValue wide_value;
@@ -2699,14 +3014,14 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             }
             if (is_wide)
             {
-                BSlashValue wide_value;
-                if (!bslash_stack_push_new_typed(ctx, ins->line, ins->data.param.type, &wide_value))
-                {
-                    success = false;
-                    goto cleanup;
-                }
                 if (ctx->spill_params && ctx->param_word_offsets && word_base + 1 < ctx->param_word_count)
                 {
+                    BSlashValue wide_value;
+                    if (!bslash_stack_push_new_typed(ctx, ins->line, ins->data.param.type, &wide_value))
+                    {
+                        success = false;
+                        goto cleanup;
+                    }
                     fprintf(ctx->out, "    RDFR %s\n", wide_value.lo);
                     bslash_clear_register_info(ctx, wide_value.lo);
                     bslash_emit_addi(ctx, wide_value.lo, -(int32_t)ctx->param_word_offsets[word_base]);
@@ -2721,20 +3036,28 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 }
                 else
                 {
-                    bslash_emit_mov(ctx, wide_value.lo, kParamRegs[word_base]);
-                    bslash_emit_mov(ctx, wide_value.hi, kParamRegs[word_base + 1]);
+                    /* Use parameter registers directly without MOV */
+                    BSlashValue param_value;
+                    param_value.type = ins->data.param.type;
+                    param_value.lo = kParamRegs[word_base];
+                    param_value.hi = kParamRegs[word_base + 1];
+                    if (!bslash_stack_push_existing_typed(ctx, ins->line, param_value))
+                    {
+                        success = false;
+                        goto cleanup;
+                    }
                 }
             }
             else
             {
-                const char *dst = NULL;
-                if (!bslash_stack_push_new(ctx, ins->line, &dst))
-                {
-                    success = false;
-                    goto cleanup;
-                }
                 if (ctx->spill_params && ctx->param_word_offsets && word_base < ctx->param_word_count)
                 {
+                    const char *dst = NULL;
+                    if (!bslash_stack_push_new(ctx, ins->line, &dst))
+                    {
+                        success = false;
+                        goto cleanup;
+                    }
                     fprintf(ctx->out, "    RDFR %s\n", dst);
                     bslash_clear_register_info(ctx, dst);
                     bslash_emit_addi(ctx, dst, -(int32_t)ctx->param_word_offsets[word_base]);
@@ -2743,7 +3066,16 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 }
                 else
                 {
-                    bslash_emit_mov(ctx, dst, kParamRegs[word_base]);
+                    /* Use parameter register directly without MOV */
+                    BSlashValue param_value;
+                    param_value.type = ins->data.param.type;
+                    param_value.lo = kParamRegs[word_base];
+                    param_value.hi = NULL;
+                    if (!bslash_stack_push_existing_typed(ctx, ins->line, param_value))
+                    {
+                        success = false;
+                        goto cleanup;
+                    }
                 }
             }
             break;
@@ -2786,6 +3118,9 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             if (bslash_value_is_wide(local_type))
             {
                 const char *addr_reg = NULL;
+                const char *cached_addr = NULL;
+                const char *cached_hi_addr = NULL;
+                bool addr_is_scratch = false;
                 const char *hi_reg = stored_value.hi;
                 bool hi_is_scratch = false;
                 if (!bslash_require_local_storage(ctx, local_index))
@@ -2825,23 +3160,60 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                         bslash_emit_movi32_u32(ctx, hi_reg, 0);
                     }
                 }
-                addr_reg = bslash_scratch_acquire(ctx, ins->line);
+                cached_addr = bslash_get_local_addr_register(ctx, local_index);
+                cached_hi_addr = bslash_get_local_addr_hi_register(ctx, local_index);
+                addr_reg = cached_addr;
                 if (!addr_reg)
                 {
-                    if (hi_is_scratch)
+                    addr_reg = bslash_scratch_acquire(ctx, ins->line);
+                    if (!addr_reg)
+                    {
+                        if (hi_is_scratch)
+                            bslash_scratch_release(ctx);
+                        bslash_release_value(ctx, stored_value);
+                        success = false;
+                        goto cleanup;
+                    }
+                    addr_is_scratch = true;
+                    if (!bslash_emit_local_addr_into(ctx, ins->line, local_index, addr_reg))
+                    {
                         bslash_scratch_release(ctx);
-                    bslash_release_value(ctx, stored_value);
-                    success = false;
-                    goto cleanup;
+                        if (hi_is_scratch)
+                            bslash_scratch_release(ctx);
+                        bslash_release_value(ctx, stored_value);
+                        success = false;
+                        goto cleanup;
+                    }
                 }
-                fprintf(ctx->out, "    RDFR %s\n", addr_reg);
-                bslash_clear_register_info(ctx, addr_reg);
-                bslash_emit_addi(ctx, addr_reg, -(int32_t)ctx->local_offsets[local_index]);
                 bslash_ensure_value_materialized(ctx, stored_value);
                 fprintf(ctx->out, "    ST [%s], %s\n", addr_reg, stored_value.lo);
-                bslash_emit_addi(ctx, addr_reg, 4);
-                fprintf(ctx->out, "    ST [%s], %s\n", addr_reg, hi_reg);
-                bslash_scratch_release(ctx);
+                if (cached_hi_addr)
+                {
+                    fprintf(ctx->out, "    ST [%s], %s\n", cached_hi_addr, hi_reg);
+                }
+                else if (cached_addr)
+                {
+                    const char *hi_addr = bslash_scratch_acquire(ctx, ins->line);
+                    if (!hi_addr)
+                    {
+                        if (hi_is_scratch)
+                            bslash_scratch_release(ctx);
+                        bslash_release_value(ctx, stored_value);
+                        success = false;
+                        goto cleanup;
+                    }
+                    bslash_emit_mov(ctx, hi_addr, cached_addr);
+                    bslash_emit_addi(ctx, hi_addr, 4);
+                    fprintf(ctx->out, "    ST [%s], %s\n", hi_addr, hi_reg);
+                    bslash_scratch_release(ctx);
+                }
+                else
+                {
+                    bslash_emit_addi(ctx, addr_reg, 4);
+                    fprintf(ctx->out, "    ST [%s], %s\n", addr_reg, hi_reg);
+                }
+                if (addr_is_scratch)
+                    bslash_scratch_release(ctx);
                 if (hi_is_scratch)
                     bslash_scratch_release(ctx);
                 bslash_release_value(ctx, stored_value);
@@ -2881,22 +3253,32 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             }
             if (ctx->opt_level > 0)
             {
-                scratch = bslash_scratch_acquire(ctx, ins->line);
-                if (!scratch)
+                const char *cached_addr = bslash_get_local_addr_register(ctx, local_index);
+                if (cached_addr)
                 {
-                    bslash_release_register(ctx, value);
-                    success = false;
-                    goto cleanup;
+                    bslash_ensure_register_materialized(ctx, value);
+                    fprintf(ctx->out, "    ST [%s], %s\n", cached_addr, value);
                 }
-            }
-            if (ctx->opt_level > 0)
-            {
-                fprintf(ctx->out, "    RDFR %s\n", scratch);
-                bslash_clear_register_info(ctx, scratch);
-                bslash_emit_addi(ctx, scratch, -(int32_t)ctx->local_offsets[local_index]);
-                bslash_ensure_register_materialized(ctx, value);
-                fprintf(ctx->out, "    ST [%s], %s\n", scratch, value);
-                bslash_scratch_release(ctx);
+                else
+                {
+                    scratch = bslash_scratch_acquire(ctx, ins->line);
+                    if (!scratch)
+                    {
+                        bslash_release_register(ctx, value);
+                        success = false;
+                        goto cleanup;
+                    }
+                    if (!bslash_emit_local_addr_into(ctx, ins->line, local_index, scratch))
+                    {
+                        bslash_scratch_release(ctx);
+                        bslash_release_register(ctx, value);
+                        success = false;
+                        goto cleanup;
+                    }
+                    bslash_ensure_register_materialized(ctx, value);
+                    fprintf(ctx->out, "    ST [%s], %s\n", scratch, value);
+                    bslash_scratch_release(ctx);
+                }
             }
             else
             {
@@ -2930,19 +3312,48 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                     success = false;
                     goto cleanup;
                 }
-                const char *scratch = bslash_scratch_acquire(ctx, ins->line);
-                if (!scratch)
+                const char *cached_addr = bslash_get_local_addr_register(ctx, local_index);
+                const char *cached_hi_addr = bslash_get_local_addr_hi_register(ctx, local_index);
+                if (cached_addr)
                 {
-                    success = false;
-                    goto cleanup;
+                    fprintf(ctx->out, "    LD %s, [%s]\n", wide_value.lo, cached_addr);
+                    if (cached_hi_addr)
+                    {
+                        fprintf(ctx->out, "    LD %s, [%s]\n", wide_value.hi, cached_hi_addr);
+                    }
+                    else
+                    {
+                        const char *hi_addr = bslash_scratch_acquire(ctx, ins->line);
+                        if (!hi_addr)
+                        {
+                            success = false;
+                            goto cleanup;
+                        }
+                        bslash_emit_mov(ctx, hi_addr, cached_addr);
+                        bslash_emit_addi(ctx, hi_addr, 4);
+                        fprintf(ctx->out, "    LD %s, [%s]\n", wide_value.hi, hi_addr);
+                        bslash_scratch_release(ctx);
+                    }
                 }
-                fprintf(ctx->out, "    RDFR %s\n", scratch);
-                bslash_clear_register_info(ctx, scratch);
-                bslash_emit_addi(ctx, scratch, -(int32_t)ctx->local_offsets[local_index]);
-                fprintf(ctx->out, "    LD %s, [%s]\n", wide_value.lo, scratch);
-                bslash_emit_addi(ctx, scratch, 4);
-                fprintf(ctx->out, "    LD %s, [%s]\n", wide_value.hi, scratch);
-                bslash_scratch_release(ctx);
+                else
+                {
+                    const char *scratch = bslash_scratch_acquire(ctx, ins->line);
+                    if (!scratch)
+                    {
+                        success = false;
+                        goto cleanup;
+                    }
+                    if (!bslash_emit_local_addr_into(ctx, ins->line, local_index, scratch))
+                    {
+                        bslash_scratch_release(ctx);
+                        success = false;
+                        goto cleanup;
+                    }
+                    fprintf(ctx->out, "    LD %s, [%s]\n", wide_value.lo, scratch);
+                    bslash_emit_addi(ctx, scratch, 4);
+                    fprintf(ctx->out, "    LD %s, [%s]\n", wide_value.hi, scratch);
+                    bslash_scratch_release(ctx);
+                }
                 bslash_clear_register_info(ctx, wide_value.lo);
                 bslash_clear_register_info(ctx, wide_value.hi);
                 break;
@@ -2990,17 +3401,28 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             }
             if (ctx->opt_level > 0)
             {
-                const char *scratch = bslash_scratch_acquire(ctx, ins->line);
-                if (!scratch)
+                const char *cached_addr = bslash_get_local_addr_register(ctx, local_index);
+                if (cached_addr)
                 {
-                    success = false;
-                    goto cleanup;
+                    fprintf(ctx->out, "    LD %s, [%s]\n", dst, cached_addr);
                 }
-                fprintf(ctx->out, "    RDFR %s\n", scratch);
-                bslash_clear_register_info(ctx, scratch);
-                bslash_emit_addi(ctx, scratch, -(int32_t)ctx->local_offsets[local_index]);
-                fprintf(ctx->out, "    LD %s, [%s]\n", dst, scratch);
-                bslash_scratch_release(ctx);
+                else
+                {
+                    const char *scratch = bslash_scratch_acquire(ctx, ins->line);
+                    if (!scratch)
+                    {
+                        success = false;
+                        goto cleanup;
+                    }
+                    if (!bslash_emit_local_addr_into(ctx, ins->line, local_index, scratch))
+                    {
+                        bslash_scratch_release(ctx);
+                        success = false;
+                        goto cleanup;
+                    }
+                    fprintf(ctx->out, "    LD %s, [%s]\n", dst, scratch);
+                    bslash_scratch_release(ctx);
+                }
             }
             else
             {
@@ -3036,9 +3458,11 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 goto cleanup;
             }
 
-            fprintf(ctx->out, "    RDFR %s\n", dst);
-            bslash_clear_register_info(ctx, dst);
-            bslash_emit_addi(ctx, dst, -(int32_t)ctx->local_offsets[local_index]);
+            if (!bslash_emit_local_addr_into(ctx, ins->line, local_index, dst))
+            {
+                success = false;
+                goto cleanup;
+            }
             bslash_clear_register_info(ctx, dst);
             break;
         }
@@ -3287,7 +3711,6 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 success = false;
                 goto cleanup;
             }
-            bslash_ensure_register_materialized(ctx, cond);
             char scoped_true_target[256];
             char scoped_false_target[256];
             bslash_make_scoped_label(ctx, scoped_true_target, sizeof(scoped_true_target), ins->data.branch.true_target);
@@ -3300,23 +3723,65 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 goto cleanup;
             }
             bool false_target_is_fallthrough = false;
+            bool true_target_is_fallthrough = false;
             if ((ii + 1) < fn->instruction_count)
             {
                 const CCInstruction *next_ins = &fn->instructions[ii + 1];
-                if (next_ins->kind == CC_INSTR_LABEL && next_ins->data.label.name &&
-                    strcmp(next_ins->data.label.name, ins->data.branch.false_target) == 0)
-                    false_target_is_fallthrough = true;
+                if (next_ins->kind == CC_INSTR_LABEL && next_ins->data.label.name)
+                {
+                    if (strcmp(next_ins->data.label.name, ins->data.branch.false_target) == 0)
+                        false_target_is_fallthrough = true;
+                    if (strcmp(next_ins->data.label.name, ins->data.branch.true_target) == 0)
+                        true_target_is_fallthrough = true;
+                }
             }
 
-            char branch_false_local[128];
-            bslash_make_temp_label(ctx, branch_false_local, sizeof(branch_false_local), "branch_false");
+            if (ctx->pending_compare_valid && cond == ctx->pending_compare_result_reg && ctx->pending_compare_branch_op)
+            {
+                const char *branch_op = ctx->pending_compare_branch_op;
+                const char *false_branch_op = ctx->pending_compare_false_branch_op;
+                if (true_target_is_fallthrough)
+                {
+                    const char *inv = false_branch_op ? false_branch_op : bslash_invert_branch_opcode(branch_op);
+                    if (inv)
+                        fprintf(ctx->out, "    %s %s\n", inv, scoped_false_target);
+                    else if (!false_target_is_fallthrough)
+                        fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
+                }
+                else if (false_target_is_fallthrough)
+                {
+                    fprintf(ctx->out, "    %s %s\n", branch_op, scoped_true_target);
+                }
+                else
+                {
+                    fprintf(ctx->out, "    %s %s\n", branch_op, scoped_true_target);
+                    fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
+                }
+            }
+            else
+            {
+                bslash_ensure_register_materialized(ctx, cond);
+                fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", cond);
+                if (true_target_is_fallthrough)
+                {
+                    if (!false_target_is_fallthrough)
+                        fprintf(ctx->out, "    BZ %s\n", scoped_false_target);
+                }
+                else if (false_target_is_fallthrough)
+                {
+                    fprintf(ctx->out, "    BNZ %s\n", scoped_true_target);
+                }
+                else
+                {
+                    fprintf(ctx->out, "    BNZ %s\n", scoped_true_target);
+                    fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
+                }
+            }
 
-            fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", cond);
-            fprintf(ctx->out, "    BZ %s\n", branch_false_local);
-            fprintf(ctx->out, "    J32 %s\n", scoped_true_target);
-            fprintf(ctx->out, "%s:\n", branch_false_local);
-            if (!false_target_is_fallthrough)
-                fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
+            ctx->pending_compare_valid = false;
+            ctx->pending_compare_result_reg = NULL;
+            ctx->pending_compare_branch_op = NULL;
+            ctx->pending_compare_false_branch_op = NULL;
             bslash_release_register(ctx, cond);
             bslash_stack_reset(ctx);
             if (bslash_local_fold_enabled(ctx))
@@ -3334,6 +3799,60 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             }
             const char *rhs = rhs_value.lo;
             const char *lhs = lhs_value.lo;
+
+            if (cc_value_type_is_float(ins->data.binop.type))
+            {
+                bslash_ensure_value_materialized(ctx, lhs_value);
+                bslash_ensure_value_materialized(ctx, rhs_value);
+                switch (ins->data.binop.op)
+                {
+                case CC_BINOP_ADD:
+                    fprintf(ctx->out, "    FADD %s, %s\n", lhs, rhs);
+                    break;
+                case CC_BINOP_SUB:
+                    fprintf(ctx->out, "    FSUB %s, %s\n", lhs, rhs);
+                    break;
+                case CC_BINOP_MUL:
+                    fprintf(ctx->out, "    FMUL %s, %s\n", lhs, rhs);
+                    break;
+                case CC_BINOP_DIV:
+                    fprintf(ctx->out, "    FDIV %s, %s\n", lhs, rhs);
+                    break;
+                default:
+                    emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line,
+                              "bslash backend does not support floating-point binop %d",
+                              (int)ins->data.binop.op);
+                    bslash_release_value(ctx, rhs_value);
+                    bslash_release_value(ctx, lhs_value);
+                    success = false;
+                    goto cleanup;
+                }
+
+                bslash_clear_register_info(ctx, lhs_value.lo);
+                if (lhs_value.hi)
+                    bslash_clear_register_info(ctx, lhs_value.hi);
+                bslash_release_value(ctx, rhs_value);
+
+                if (bslash_value_is_wide(ins->data.binop.type))
+                {
+                    if (!bslash_stack_push_existing_typed(ctx, ins->line, lhs_value))
+                    {
+                        bslash_release_value(ctx, lhs_value);
+                        success = false;
+                        goto cleanup;
+                    }
+                }
+                else
+                {
+                    if (!bslash_stack_push_existing(ctx, ins->line, lhs))
+                    {
+                        bslash_release_register(ctx, lhs);
+                        success = false;
+                        goto cleanup;
+                    }
+                }
+                break;
+            }
 
             if (bslash_value_is_wide(ins->data.binop.type))
             {
@@ -3843,6 +4362,29 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             }
             bool pushed = false;
             bool rhs_released = false;
+            bool lhs_is_param_word = bslash_register_holds_live_param_word(ctx, lhs);
+            bool rhs_is_param_word = bslash_register_holds_live_param_word(ctx, rhs);
+
+            if (lhs_is_param_word && !rhs_is_param_word)
+            {
+                switch (ins->data.binop.op)
+                {
+                case CC_BINOP_ADD:
+                case CC_BINOP_MUL:
+                case CC_BINOP_AND:
+                case CC_BINOP_OR:
+                case CC_BINOP_XOR:
+                {
+                    const char *tmp = lhs;
+                    lhs = rhs;
+                    rhs = tmp;
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+
             switch (ins->data.binop.op)
             {
             case CC_BINOP_ADD:
@@ -4062,31 +4604,66 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
         }
         case CC_INSTR_COMPARE:
         {
-            const char *rhs = bslash_stack_pop(ctx, ins->line);
-            const char *lhs = bslash_stack_pop(ctx, ins->line);
-            if (!rhs || !lhs)
+            BSlashValue rhs_value;
+            BSlashValue lhs_value;
+            bslash_value_clear(&rhs_value);
+            bslash_value_clear(&lhs_value);
+            if (!bslash_stack_pop_value(ctx, ins->line, &rhs_value) ||
+                !bslash_stack_pop_value(ctx, ins->line, &lhs_value))
             {
-                if (rhs)
-                    bslash_release_register(ctx, rhs);
-                if (lhs)
-                    bslash_release_register(ctx, lhs);
+                bslash_release_value(ctx, rhs_value);
+                bslash_release_value(ctx, lhs_value);
                 success = false;
                 goto cleanup;
             }
-            const char *branch_op = bslash_compare_branch_opcode(ins->data.compare.op, ins->data.compare.is_unsigned);
+
+            const char *rhs = rhs_value.lo;
+            const char *lhs = lhs_value.lo;
+
+            bool is_float_compare = cc_value_type_is_float(ins->data.compare.type);
+            const char *branch_op = bslash_compare_branch_opcode(ins->data.compare.op,
+                                                                  is_float_compare ? false : ins->data.compare.is_unsigned);
             if (!branch_op)
             {
                 emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "compare op %d unsupported", (int)ins->data.compare.op);
-                bslash_release_register(ctx, rhs);
-                bslash_release_register(ctx, lhs);
+                bslash_release_value(ctx, rhs_value);
+                bslash_release_value(ctx, lhs_value);
                 success = false;
                 goto cleanup;
             }
-            bslash_ensure_register_materialized(ctx, lhs);
-            bslash_ensure_register_materialized(ctx, rhs);
-            fprintf(ctx->out, "    CMP %s, %s\n", lhs, rhs);
-            bslash_release_register(ctx, rhs);
-            const char *false_branch_op = bslash_compare_false_branch_opcode(ins->data.compare.op, ins->data.compare.is_unsigned);
+
+            bslash_ensure_value_materialized(ctx, lhs_value);
+            bslash_ensure_value_materialized(ctx, rhs_value);
+            if (is_float_compare)
+                fprintf(ctx->out, "    FCMP %s, %s\n", lhs, rhs);
+            else
+                fprintf(ctx->out, "    CMP %s, %s\n", lhs, rhs);
+
+            bool next_is_branch = ((ii + 1) < fn->instruction_count) &&
+                                  (fn->instructions[ii + 1].kind == CC_INSTR_BRANCH);
+
+            bslash_release_value(ctx, rhs_value);
+            if (next_is_branch)
+            {
+                if (lhs_value.hi)
+                    bslash_release_register(ctx, lhs_value.hi);
+                ctx->pending_compare_valid = true;
+                ctx->pending_compare_result_reg = lhs;
+                ctx->pending_compare_branch_op = branch_op;
+                ctx->pending_compare_false_branch_op = bslash_compare_false_branch_opcode(
+                    ins->data.compare.op,
+                    is_float_compare ? false : ins->data.compare.is_unsigned);
+                bslash_clear_register_info(ctx, lhs);
+                if (!bslash_stack_push_existing(ctx, ins->line, lhs))
+                {
+                    success = false;
+                    goto cleanup;
+                }
+                break;
+            }
+
+            const char *false_branch_op = bslash_compare_false_branch_opcode(ins->data.compare.op,
+                                                                              is_float_compare ? false : ins->data.compare.is_unsigned);
             char false_label[128];
             char end_label[128];
             bslash_make_temp_label(ctx, false_label, sizeof(false_label), "cmp_false");
@@ -4111,6 +4688,9 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 bslash_emit_movi32_u32(ctx, lhs, 1);
                 fprintf(ctx->out, "%s:\n", end_label);
             }
+
+            if (lhs_value.hi)
+                bslash_release_register(ctx, lhs_value.hi);
             bslash_clear_register_info(ctx, lhs);
             if (!bslash_stack_push_existing(ctx, ins->line, lhs))
             {

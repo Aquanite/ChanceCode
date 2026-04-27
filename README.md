@@ -43,6 +43,14 @@ Key flags:
 - `--option key=value` passes backend-specific options.
 - `-O0|-O1|-O2|-O3` enables IR optimization passes.
 
+Extended instructions (text `.ccb`, loaded as first-class IR ops):
+- `addr_index_ptr <i32|i64>`: stack `(ptr,index)` -> `(ptr)` via pointer-int add.
+- `loadsx_indirect <from> <to>`: expands to `load_indirect <from>` + `convert sext <from> <to>`.
+- `loadzx_indirect <from> <to>`: expands to `load_indirect <from>` + `convert zext <from> <to>`.
+- `br_test_zero <type> <true> <false> [unsigned]`: expands to `const 0`, `compare ne`, `branch`.
+
+During backend emission, `chancecodec` legalizes these ops into core instructions so existing backends consume them uniformly.
+
 ## Specs
 See the full bytecode specification in [SPEC.md](SPEC.md).
 

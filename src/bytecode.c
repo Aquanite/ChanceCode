@@ -85,6 +85,12 @@ static void cc_instruction_free(CCInstruction *ins)
         ins->data.branch.true_target = NULL;
         ins->data.branch.false_target = NULL;
         break;
+    case CC_INSTR_BR_TEST_ZERO:
+        free(ins->data.br_test_zero.true_target);
+        free(ins->data.br_test_zero.false_target);
+        ins->data.br_test_zero.true_target = NULL;
+        ins->data.br_test_zero.false_target = NULL;
+        break;
     case CC_INSTR_CALL:
         free(ins->data.call.symbol);
         ins->data.call.symbol = NULL;
@@ -735,6 +741,9 @@ static bool cc_instruction_is_pure(const CCInstruction *ins)
     case CC_INSTR_COMPARE:
     case CC_INSTR_TEST_NULL:
     case CC_INSTR_DUP:
+    case CC_INSTR_ADDR_INDEX_PTR:
+    case CC_INSTR_LOADSX_INDIRECT:
+    case CC_INSTR_LOADZX_INDIRECT:
     case CC_INSTR_CONVERT:
         return true;
     default:
@@ -1039,6 +1048,28 @@ static void cc_function_remove_instructions(CCFunction *fn, size_t index, size_t
     fn->instruction_count -= count;
     for (size_t i = fn->instruction_count; i < old_count; ++i)
         memset(&fn->instructions[i], 0, sizeof(CCInstruction));
+}
+
+static bool cc_function_insert_instruction_slots(CCFunction *fn, size_t index, size_t count)
+{
+    if (!fn || count == 0)
+        return true;
+    if (index > fn->instruction_count)
+        index = fn->instruction_count;
+
+    size_t old_count = fn->instruction_count;
+    size_t new_count = old_count + count;
+    if (!cc_function_reserve_instructions(fn, new_count))
+        return false;
+
+    size_t tail = old_count - index;
+    if (tail > 0)
+        memmove(&fn->instructions[index + count], &fn->instructions[index], tail * sizeof(CCInstruction));
+
+    for (size_t i = 0; i < count; ++i)
+        memset(&fn->instructions[index + i], 0, sizeof(CCInstruction));
+    fn->instruction_count = new_count;
+    return true;
 }
 
 static bool cc_function_prune_dropped_values(CCFunction *fn)
@@ -2013,6 +2044,7 @@ static bool cc_instruction_is_optimizer_barrier(const CCInstruction *ins)
     case CC_INSTR_JUMP:
     case CC_INSTR_JUMP_INDIRECT:
     case CC_INSTR_BRANCH:
+    case CC_INSTR_BR_TEST_ZERO:
     case CC_INSTR_RET:
     case CC_INSTR_CALL:
     case CC_INSTR_CALL_INDIRECT:
@@ -2405,6 +2437,7 @@ static bool cc_function_has_control_flow(const CCFunction *fn)
         case CC_INSTR_JUMP:
         case CC_INSTR_JUMP_INDIRECT:
         case CC_INSTR_BRANCH:
+        case CC_INSTR_BR_TEST_ZERO:
             return true;
         default:
             break;
@@ -2471,6 +2504,157 @@ void cc_module_optimize(CCModule *module, int opt_level)
                     progress = true;
             }
         }
+    }
+}
+
+static bool cc_function_legalize_extended_instructions(CCFunction *fn)
+{
+    if (!fn || fn->instruction_count == 0)
+        return true;
+
+    size_t i = 0;
+    while (i < fn->instruction_count)
+    {
+        CCInstruction *ins = &fn->instructions[i];
+        switch (ins->kind)
+        {
+        case CC_INSTR_ADDR_INDEX_PTR:
+        {
+            CCValueType idx_ty = ins->data.addr_index_ptr.index_type;
+            size_t line = ins->line;
+            uint32_t dbg_file = ins->debug_file;
+            uint32_t dbg_line = ins->debug_line;
+            uint32_t dbg_col = ins->debug_column;
+
+            ins->kind = CC_INSTR_CONVERT;
+            ins->data.convert.kind = CC_CONVERT_BITCAST;
+            ins->data.convert.from_type = CC_TYPE_PTR;
+            ins->data.convert.to_type = idx_ty;
+
+            if (!cc_function_insert_instruction_slots(fn, i + 1, 2))
+                return false;
+
+            CCInstruction *add = &fn->instructions[i + 1];
+            add->kind = CC_INSTR_BINOP;
+            add->line = line;
+            add->debug_file = dbg_file;
+            add->debug_line = dbg_line;
+            add->debug_column = dbg_col;
+            add->data.binop.op = CC_BINOP_ADD;
+            add->data.binop.type = idx_ty;
+            add->data.binop.is_unsigned = !cc_value_type_is_signed(idx_ty);
+
+            CCInstruction *to_ptr = &fn->instructions[i + 2];
+            to_ptr->kind = CC_INSTR_CONVERT;
+            to_ptr->line = line;
+            to_ptr->debug_file = dbg_file;
+            to_ptr->debug_line = dbg_line;
+            to_ptr->debug_column = dbg_col;
+            to_ptr->data.convert.kind = CC_CONVERT_BITCAST;
+            to_ptr->data.convert.from_type = idx_ty;
+            to_ptr->data.convert.to_type = CC_TYPE_PTR;
+            i += 3;
+            break;
+        }
+        case CC_INSTR_LOADSX_INDIRECT:
+        case CC_INSTR_LOADZX_INDIRECT:
+        {
+            CCValueType from_ty = ins->data.ext_load.from_type;
+            CCValueType to_ty = ins->data.ext_load.to_type;
+            CCConvertKind conv_kind = (ins->kind == CC_INSTR_LOADSX_INDIRECT) ? CC_CONVERT_SEXT : CC_CONVERT_ZEXT;
+            size_t line = ins->line;
+            uint32_t dbg_file = ins->debug_file;
+            uint32_t dbg_line = ins->debug_line;
+            uint32_t dbg_col = ins->debug_column;
+
+            ins->kind = CC_INSTR_LOAD_INDIRECT;
+            ins->data.memory.type = from_ty;
+            ins->data.memory.is_unsigned = !cc_value_type_is_signed(from_ty);
+
+            if (!cc_function_insert_instruction_slots(fn, i + 1, 1))
+                return false;
+
+            CCInstruction *cv = &fn->instructions[i + 1];
+            cv->kind = CC_INSTR_CONVERT;
+            cv->line = line;
+            cv->debug_file = dbg_file;
+            cv->debug_line = dbg_line;
+            cv->debug_column = dbg_col;
+            cv->data.convert.kind = conv_kind;
+            cv->data.convert.from_type = from_ty;
+            cv->data.convert.to_type = to_ty;
+            i += 2;
+            break;
+        }
+        case CC_INSTR_BR_TEST_ZERO:
+        {
+            CCValueType test_ty = ins->data.br_test_zero.test_type;
+            bool is_unsigned = ins->data.br_test_zero.is_unsigned;
+            char *true_target = ins->data.br_test_zero.true_target;
+            char *false_target = ins->data.br_test_zero.false_target;
+            ins->data.br_test_zero.true_target = NULL;
+            ins->data.br_test_zero.false_target = NULL;
+
+            size_t line = ins->line;
+            uint32_t dbg_file = ins->debug_file;
+            uint32_t dbg_line = ins->debug_line;
+            uint32_t dbg_col = ins->debug_column;
+
+            ins->kind = CC_INSTR_CONST;
+            ins->data.constant.type = test_ty;
+            ins->data.constant.is_null = (test_ty == CC_TYPE_PTR);
+            ins->data.constant.is_unsigned = !cc_value_type_is_signed(test_ty) && test_ty != CC_TYPE_PTR;
+            if (test_ty == CC_TYPE_F32)
+                ins->data.constant.value.f32 = 0.0f;
+            else if (test_ty == CC_TYPE_F64)
+                ins->data.constant.value.f64 = 0.0;
+            else
+                ins->data.constant.value.u64 = 0ULL;
+
+            if (!cc_function_insert_instruction_slots(fn, i + 1, 2))
+            {
+                free(true_target);
+                free(false_target);
+                return false;
+            }
+
+            CCInstruction *cmp = &fn->instructions[i + 1];
+            cmp->kind = CC_INSTR_COMPARE;
+            cmp->line = line;
+            cmp->debug_file = dbg_file;
+            cmp->debug_line = dbg_line;
+            cmp->debug_column = dbg_col;
+            cmp->data.compare.op = CC_COMPARE_NE;
+            cmp->data.compare.type = test_ty;
+            cmp->data.compare.is_unsigned = is_unsigned;
+
+            CCInstruction *br = &fn->instructions[i + 2];
+            br->kind = CC_INSTR_BRANCH;
+            br->line = line;
+            br->debug_file = dbg_file;
+            br->debug_line = dbg_line;
+            br->debug_column = dbg_col;
+            br->data.branch.true_target = true_target;
+            br->data.branch.false_target = false_target;
+            i += 3;
+            break;
+        }
+        default:
+            ++i;
+            break;
+        }
+    }
+
+    return true;
+}
+
+void cc_module_legalize_for_backend(CCModule *module)
+{
+    if (!module)
+        return;
+    for (size_t i = 0; i < module->function_count; ++i)
+    {
+        (void)cc_function_legalize_extended_instructions(&module->functions[i]);
     }
 }
 
@@ -2764,6 +2948,33 @@ static bool cc_write_instruction(FILE *out, const CCInstruction *ins)
     case CC_INSTR_DUP:
     {
         if (!cc_write_value_type(out, ins->data.dup.type))
+            return false;
+        return true;
+    }
+    case CC_INSTR_ADDR_INDEX_PTR:
+    {
+        if (!cc_write_value_type(out, ins->data.addr_index_ptr.index_type))
+            return false;
+        return true;
+    }
+    case CC_INSTR_LOADSX_INDIRECT:
+    case CC_INSTR_LOADZX_INDIRECT:
+    {
+        if (!cc_write_value_type(out, ins->data.ext_load.from_type))
+            return false;
+        if (!cc_write_value_type(out, ins->data.ext_load.to_type))
+            return false;
+        return true;
+    }
+    case CC_INSTR_BR_TEST_ZERO:
+    {
+        if (!cc_write_value_type(out, ins->data.br_test_zero.test_type))
+            return false;
+        if (!cc_write_bool(out, ins->data.br_test_zero.is_unsigned))
+            return false;
+        if (!cc_write_string(out, ins->data.br_test_zero.true_target))
+            return false;
+        if (!cc_write_string(out, ins->data.br_test_zero.false_target))
             return false;
         return true;
     }

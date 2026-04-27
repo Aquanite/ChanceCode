@@ -100,7 +100,11 @@ extern "C"
         CC_INSTR_CALL_INDIRECT,
         CC_INSTR_JUMP_INDIRECT,
         CC_INSTR_TEST_NULL,
-        CC_INSTR_DUP
+        CC_INSTR_DUP,
+        CC_INSTR_ADDR_INDEX_PTR,
+        CC_INSTR_LOADSX_INDIRECT,
+        CC_INSTR_LOADZX_INDIRECT,
+        CC_INSTR_BR_TEST_ZERO
     } CCInstrKind;
 
     typedef enum
@@ -271,6 +275,22 @@ extern "C"
             } dup;
             struct
             {
+                CCValueType index_type;
+            } addr_index_ptr;
+            struct
+            {
+                CCValueType from_type;
+                CCValueType to_type;
+            } ext_load;
+            struct
+            {
+                CCValueType test_type;
+                bool is_unsigned;
+                char *true_target;
+                char *false_target;
+            } br_test_zero;
+            struct
+            {
                 bool has_value;
             } ret;
             struct
@@ -341,6 +361,7 @@ extern "C"
     const char *cc_value_type_name(CCValueType type);
 
     void cc_module_optimize(CCModule *module, int opt_level);
+    void cc_module_legalize_for_backend(CCModule *module);
 
     bool cc_module_write_binary(const CCModule *module, const char *path, CCDiagnosticSink *sink);
 

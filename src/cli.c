@@ -564,6 +564,8 @@ int main(int argc, char **argv)
     bool emit_ok = true;
     if (backend)
     {
+        cc_module_legalize_for_backend(&module);
+
         CCBackendOption stack_options[20];
         size_t stack_option_count = option_count;
         if (option_count > 0)
