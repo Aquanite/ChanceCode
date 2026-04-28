@@ -1686,6 +1686,38 @@ static void bslash_ensure_value_materialized(BSlashFunctionContext *ctx, BSlashV
         bslash_ensure_register_materialized(ctx, value.hi);
 }
 
+static bool bslash_ensure_wide_value(BSlashFunctionContext *ctx, size_t line, BSlashValue *value)
+{
+    if (!ctx || !value || !value->lo)
+        return false;
+    if (value->hi)
+        return true;
+
+    int hi_idx = bslash_find_free_register(ctx, false);
+    if (hi_idx < 0)
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, line, "no registers available to widen value");
+        return false;
+    }
+
+    ctx->reg_in_use[hi_idx] = true;
+    value->hi = kValueStackOrder[hi_idx];
+    bslash_clear_register_info(ctx, value->hi);
+
+    if (cc_value_type_is_signed(value->type))
+    {
+        bslash_emit_mov(ctx, value->hi, value->lo);
+        fprintf(ctx->out, "    ASRI8 %s, #0x1F\n", value->hi);
+        bslash_clear_register_info(ctx, value->hi);
+    }
+    else
+    {
+        bslash_emit_movi32_u32(ctx, value->hi, 0);
+    }
+
+    return true;
+}
+
 static bool bslash_stack_push_new_typed(BSlashFunctionContext *ctx, size_t line, CCValueType type, BSlashValue *out_value)
 {
     BSlashValue value;
@@ -3740,21 +3772,26 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             {
                 const char *branch_op = ctx->pending_compare_branch_op;
                 const char *false_branch_op = ctx->pending_compare_false_branch_op;
+                const char *fallthrough_branch_op = false_branch_op ? false_branch_op : bslash_invert_branch_opcode(branch_op);
+                char branch_skip_label[128];
+                bslash_make_temp_label(ctx, branch_skip_label, sizeof(branch_skip_label), "branch_skip");
                 if (true_target_is_fallthrough)
                 {
-                    const char *inv = false_branch_op ? false_branch_op : bslash_invert_branch_opcode(branch_op);
-                    if (inv)
-                        fprintf(ctx->out, "    %s %s\n", inv, scoped_false_target);
-                    else if (!false_target_is_fallthrough)
-                        fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
+                    fprintf(ctx->out, "    %s %s\n", branch_op, branch_skip_label);
+                    fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
+                    fprintf(ctx->out, "%s:\n", branch_skip_label);
                 }
                 else if (false_target_is_fallthrough)
                 {
-                    fprintf(ctx->out, "    %s %s\n", branch_op, scoped_true_target);
+                    fprintf(ctx->out, "    %s %s\n", fallthrough_branch_op, branch_skip_label);
+                    fprintf(ctx->out, "    J32 %s\n", scoped_true_target);
+                    fprintf(ctx->out, "%s:\n", branch_skip_label);
                 }
                 else
                 {
-                    fprintf(ctx->out, "    %s %s\n", branch_op, scoped_true_target);
+                    fprintf(ctx->out, "    %s %s\n", fallthrough_branch_op, branch_skip_label);
+                    fprintf(ctx->out, "    J32 %s\n", scoped_true_target);
+                    fprintf(ctx->out, "%s:\n", branch_skip_label);
                     fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
                 }
             }
@@ -3762,18 +3799,25 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             {
                 bslash_ensure_register_materialized(ctx, cond);
                 fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", cond);
+                char branch_skip_label[128];
+                bslash_make_temp_label(ctx, branch_skip_label, sizeof(branch_skip_label), "branch_skip");
                 if (true_target_is_fallthrough)
                 {
-                    if (!false_target_is_fallthrough)
-                        fprintf(ctx->out, "    BZ %s\n", scoped_false_target);
+                    fprintf(ctx->out, "    BNZ %s\n", branch_skip_label);
+                    fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
+                    fprintf(ctx->out, "%s:\n", branch_skip_label);
                 }
                 else if (false_target_is_fallthrough)
                 {
-                    fprintf(ctx->out, "    BNZ %s\n", scoped_true_target);
+                    fprintf(ctx->out, "    BZ %s\n", branch_skip_label);
+                    fprintf(ctx->out, "    J32 %s\n", scoped_true_target);
+                    fprintf(ctx->out, "%s:\n", branch_skip_label);
                 }
                 else
                 {
-                    fprintf(ctx->out, "    BNZ %s\n", scoped_true_target);
+                    fprintf(ctx->out, "    BZ %s\n", branch_skip_label);
+                    fprintf(ctx->out, "    J32 %s\n", scoped_true_target);
+                    fprintf(ctx->out, "%s:\n", branch_skip_label);
                     fprintf(ctx->out, "    J32 %s\n", scoped_false_target);
                 }
             }
@@ -3859,6 +3903,14 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 bool wide_handled = true;
                 bslash_ensure_value_materialized(ctx, lhs_value);
                 bslash_ensure_value_materialized(ctx, rhs_value);
+                if (!bslash_ensure_wide_value(ctx, ins->line, &lhs_value) ||
+                    !bslash_ensure_wide_value(ctx, ins->line, &rhs_value))
+                {
+                    bslash_release_value(ctx, rhs_value);
+                    bslash_release_value(ctx, lhs_value);
+                    success = false;
+                    goto cleanup;
+                }
                 switch (ins->data.binop.op)
                 {
                 case CC_BINOP_ADD:
@@ -4207,6 +4259,13 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
                 case CC_BINOP_SHL:
                 {
                     uint64_t shift_raw = 0;
+                    if (!bslash_ensure_wide_value(ctx, ins->line, &lhs_value))
+                    {
+                        bslash_release_value(ctx, rhs_value);
+                        bslash_release_value(ctx, lhs_value);
+                        success = false;
+                        goto cleanup;
+                    }
                     if (!bslash_get_value_const64(ctx, rhs_value, &shift_raw))
                     {
                         /* Runtime 64-bit shift count: mask to 0..63 and shift one bit per iteration. */

@@ -1215,6 +1215,27 @@ static bool arm64_is_raw_export_symbol(const char *name)
     return strncmp(name, ARM64_RAW_EXPORT_PREFIX, strlen(ARM64_RAW_EXPORT_PREFIX)) == 0;
 }
 
+static const CCGlobal *arm64_find_global(const Arm64ModuleContext *ctx, const char *name)
+{
+	if (!ctx || !ctx->module || !name || name[0] == '\0')
+		return NULL;
+	for (size_t i = 0; i < ctx->module->global_count; ++i)
+	{
+		const CCGlobal *global = &ctx->module->globals[i];
+		if (!global->name)
+			continue;
+		if (strcmp(global->name, name) == 0)
+			return global;
+		{
+			char global_fmt_buf[256];
+			const char *global_fmt = arm64_format_symbol(ctx, global->name, global_fmt_buf, sizeof(global_fmt_buf));
+			if (global_fmt && strcmp(global_fmt, name) == 0)
+				return global;
+		}
+	}
+	return NULL;
+}
+
 static const char *arm64_visible_symbol_name(const char *name)
 {
     if (!name)
@@ -1944,10 +1965,28 @@ static bool arm64_emit_load_global(Arm64FunctionContext *ctx, const CCInstructio
 	FILE *out = ctx->out;
 	const char *addr_reg = ARM64_SCRATCH_GP_REGS64[0];
 	const char *symbol = ins->data.global.symbol;
+	CCValueType type = ins->data.global.type;
+	const CCGlobal *global = arm64_find_global(ctx->module, symbol);
+	if (global && global->is_const && global->init.kind == CC_GLOBAL_INIT_PTRS &&
+		global->init.payload.ptrs.count == 1)
+	{
+		const char *entry = global->init.payload.ptrs.symbols[0];
+		if (entry && entry[0] != '\0' && strcmp(entry, "null") != 0)
+		{
+			arm64_emit_symbol_address(ctx->module, out, entry, addr_reg);
+			Arm64Value direct_ptr;
+			memset(&direct_ptr, 0, sizeof(direct_ptr));
+			direct_ptr.kind = ARM64_VALUE_REGISTER;
+			direct_ptr.type = type;
+			direct_ptr.is_unsigned = !cc_value_type_is_signed(type);
+			direct_ptr.data.reg.name = addr_reg;
+			direct_ptr.data.reg.is_w = false;
+			return function_stack_push(ctx, direct_ptr);
+		}
+	}
 	if (ctx->module && module_has_function(ctx->module->module, symbol))
 		symbol = arm64_module_symbol_alias(ctx->module, symbol);
 	arm64_emit_symbol_address(ctx->module, out, symbol, addr_reg);
-	CCValueType type = ins->data.global.type;
 	Arm64Value result;
 	memset(&result, 0, sizeof(result));
 	result.kind = ARM64_VALUE_REGISTER;
@@ -2164,10 +2203,8 @@ static bool arm64_emit_addr_param(Arm64FunctionContext *ctx, const CCInstruction
 			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "vararg base requested in non-varargs function");
 			return false;
 		}
-		const char *addr_reg = ARM64_SCRATCH_GP_REGS64[1];
-		if (!arm64_emit_stack_address(ctx, ins->line, addr_reg, ctx->vararg_area_offset))
-			return false;
-		fprintf(ctx->out, "    ldr %s, [%s]\n", dst_reg, addr_reg);
+		/* Pass x15 directly as the va_list - it already points to the caller's varargs */
+		fprintf(ctx->out, "    mov %s, %s\n", dst_reg, ARM64_VARARG_PTR_REG);
 	}
 	else
 	{
@@ -3271,19 +3308,22 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 			}
 		}
 
-		if (vararg_pack_base == 0)
+		if (vararg_count > 0)
 		{
-			fprintf(ctx->out, "    mov %s, sp\n", ARM64_VARARG_PTR_REG);
-		}
-		else if (vararg_pack_base <= 4095)
-		{
-			fprintf(ctx->out, "    add %s, sp, #%zu\n", ARM64_VARARG_PTR_REG, vararg_pack_base);
-		}
-		else
-		{
-			const char *tmp = ARM64_SCRATCH_GP_REGS64[0];
-			arm64_mov_imm(ctx->out, tmp, false, vararg_pack_base);
-			fprintf(ctx->out, "    add %s, sp, %s\n", ARM64_VARARG_PTR_REG, tmp);
+			if (vararg_pack_base == 0)
+			{
+				fprintf(ctx->out, "    mov %s, sp\n", ARM64_VARARG_PTR_REG);
+			}
+			else if (vararg_pack_base <= 4095)
+			{
+				fprintf(ctx->out, "    add %s, sp, #%zu\n", ARM64_VARARG_PTR_REG, vararg_pack_base);
+			}
+			else
+			{
+				const char *tmp = ARM64_SCRATCH_GP_REGS64[0];
+				arm64_mov_imm(ctx->out, tmp, false, vararg_pack_base);
+				fprintf(ctx->out, "    add %s, sp, %s\n", ARM64_VARARG_PTR_REG, tmp);
+			}
 		}
 	}
 
@@ -3564,8 +3604,9 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	if (ctx->fn->is_varargs)
 	{
 		ctx->has_vararg_area = true;
+		/* Vararg area is stored by caller outside the frame; x15 pointer is preserved in a caller-saved slot */
 		ctx->vararg_area_offset = slot_index * 8;
-		slot_index += 1;
+		/* Don't increment slot_index here; vararg area is not part of our stack frame */
 	}
 
 	param_local_bytes = slot_index * 8;
@@ -3675,10 +3716,9 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 
 	if (ctx->has_vararg_area)
 	{
-		const char *addr_reg = ARM64_SCRATCH_GP_REGS64[0];
-		if (!arm64_emit_stack_address(ctx, 0, addr_reg, ctx->vararg_area_offset))
-			goto fail;
-		fprintf(ctx->out, "    str %s, [%s]\n", ARM64_VARARG_PTR_REG, addr_reg);
+		/* Varargs are passed via x15 from caller; just preserve it throughout the function.
+		   The va_list is the x15 register value itself, not stored in frame. */
+		/* No need to explicitly save x15 here - it will be used directly by va_start/va_arg */
 	}
 
 	for (size_t i = 0; i < ctx->fn->instruction_count; ++i)
